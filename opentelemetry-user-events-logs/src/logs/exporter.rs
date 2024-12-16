@@ -126,32 +126,36 @@ impl UserEventsExporter {
     }
 
     fn get_severity_level(&self, severity: Severity) -> Level {
-        match severity {
-            Severity::Debug
-            | Severity::Debug2
-            | Severity::Debug3
-            | Severity::Debug4
-            | Severity::Trace
-            | Severity::Trace2
-            | Severity::Trace3
-            | Severity::Trace4 => eventheader::Level::Verbose,
+        // Lookup table for Severity -> Level mapping
+        const SEVERITY_TO_LEVEL: [Level; 24] = [
+            Level::Verbose,       // Severity::Trace (1)
+            Level::Verbose,       // Severity::Trace2 (2)
+            Level::Verbose,       // Severity::Trace3 (3)
+            Level::Verbose,       // Severity::Trace4 (4)
+            Level::Verbose,       // Severity::Debug (5)
+            Level::Verbose,       // Severity::Debug2 (6)
+            Level::Verbose,       // Severity::Debug3 (7)
+            Level::Verbose,       // Severity::Debug4 (8)
+            Level::Informational, // Severity::Info (9)
+            Level::Informational, // Severity::Info2 (10)
+            Level::Informational, // Severity::Info3 (11)
+            Level::Informational, // Severity::Info4 (12)
+            Level::Warning,       // Severity::Warn (13)
+            Level::Warning,       // Severity::Warn2 (14)
+            Level::Warning,       // Severity::Warn3 (15)
+            Level::Warning,       // Severity::Warn4 (16)
+            Level::Error,         // Severity::Error (17)
+            Level::Error,         // Severity::Error2 (18)
+            Level::Error,         // Severity::Error3 (19)
+            Level::Error,         // Severity::Error4 (20)
+            Level::CriticalError, // Severity::Fatal (21)
+            Level::CriticalError, // Severity::Fatal2 (22)
+            Level::CriticalError, // Severity::Fatal3 (23)
+            Level::CriticalError, // Severity::Fatal4 (24)
+        ];
 
-            Severity::Info | Severity::Info2 | Severity::Info3 | Severity::Info4 => {
-                eventheader::Level::Informational
-            }
-
-            Severity::Error | Severity::Error2 | Severity::Error3 | Severity::Error4 => {
-                eventheader::Level::Error
-            }
-
-            Severity::Fatal | Severity::Fatal2 | Severity::Fatal3 | Severity::Fatal4 => {
-                eventheader::Level::CriticalError
-            }
-
-            Severity::Warn | Severity::Warn2 | Severity::Warn3 | Severity::Warn4 => {
-                eventheader::Level::Warning
-            }
-        }
+        // Convert `Severity` to usize and perform the lookup
+        SEVERITY_TO_LEVEL[severity as usize - 1] // -1 to adjust for 1-based indexing
     }
 
     #[allow(dead_code)]
