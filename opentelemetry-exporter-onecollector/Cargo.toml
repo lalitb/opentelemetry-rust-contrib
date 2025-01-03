@@ -1,0 +1,17 @@
+[package]
+name = "opentelemetry-exporter-onecollector"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+opentelemetry = { git = "https://github.com/open-telemetry/opentelemetry-rust.git" , rev = "42b4f2f", features = ["logs"] }
+opentelemetry_sdk = { git = "https://github.com/open-telemetry/opentelemetry-rust.git", rev = "42b4f2f", features = ["logs"] }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+serde_json = "1.0"
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+tokio = { version = "1.0", features = ["full"] }
+base64 = "0.22"
+syn = {version = "2.0.87"}
+
+[dev-dependencies]
+tokio = { version = "1.0", features = ["full"] }
