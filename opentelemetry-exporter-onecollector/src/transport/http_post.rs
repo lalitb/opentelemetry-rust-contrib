@@ -9,15 +9,15 @@ pub enum TransportMechanism {
 pub struct TransportClient {
     client: Arc<Client>,
     endpoint: String,
-    mechanism: TransportMechanism,
+   _mechanism: TransportMechanism,
 }
 
 impl TransportClient {
-    pub fn new(endpoint: &str, mechanism: TransportMechanism) -> Self {
+    pub fn new(endpoint: &str, _mechanism: TransportMechanism) -> Self {
         Self {
             client: Arc::new(Client::new()),
             endpoint: endpoint.to_string(),
-            mechanism,
+            _mechanism,
         }
     }
 

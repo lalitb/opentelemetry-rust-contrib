@@ -1,5 +1,5 @@
 use crate::contextual_info::ContextualInfo;
-use crate::serialization::{serialize_log_record, SerializationFormat};
+use crate::serialization::{serialize_log_batch, SerializationFormat};
 use crate::transport::{TransportClient, TransportMechanism};
 use opentelemetry_sdk::export::logs::{LogBatch, LogExporter};
 use opentelemetry_sdk::logs::{LogError, LogResult};
@@ -11,7 +11,7 @@ use std::{
 };
 
 pub struct OneCollectorExporter {
-    transport_client: TransportClient,
+    transport_client: Arc<TransportClient>,
     serialization_format: SerializationFormat,
     contextual_info: Arc<Mutex<ContextualInfo>>,
 }
@@ -30,17 +30,16 @@ impl OneCollectorExporter {
         contextual_info: Arc<Mutex<ContextualInfo>>,
     ) -> Self {
         Self {
-            transport_client: TransportClient::new(endpoint, transport_mechanism),
+            transport_client: Arc::new(TransportClient::new(endpoint, transport_mechanism)),
             serialization_format,
             contextual_info,
         }
     }
 
     fn prepare_payload(&self, record: &LogBatch<'_>) -> Vec<Value> {
-        record
-            .iter()
-            .map(|(log_record, _)| {
-                let mut payload = serialize_log_record(log_record, &self.serialization_format);
+        serialize_log_batch(record, &self.serialization_format)
+            .into_iter()
+            .map(|mut payload| {
                 self.contextual_info
                     .lock()
                     .unwrap()
