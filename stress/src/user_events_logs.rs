@@ -1,4 +1,4 @@
-//! Run this stress test using `$ sudo -E ~/.cargo/bin/cargo run --bin user_events --release -- <num-of-threads>`.
+//! Run this stress test using `$ sudo -E ~/.cargo/bin/cargo run --bin user_events_logs --release -- <num-of-threads>`.
 //!
 //! IMPORTANT:
 //!     To test with `user_events` enabled, perform the following step before running the test:
@@ -10,17 +10,17 @@
 //!
 //!
 // Conf - AMD EPYC 7763 64-Core Processor 2.44 GHz, 64GB RAM, Cores:8 , Logical processors: 16
-// Stress Test Results (user_events disabled)
+// Stress Test Results (user_events disabled at kernel level)
 // Threads: 1 - Average Throughput: 42,086,520 iterations/sec
 // Threads: 5 - Average Throughput: 35,767,375 iterations/sec
 // Threads: 10 - Average Throughput: 29,189,340 iterations/sec
 // Threads: 16 - Average Throughput: 19,579,138 iterations/sec
 
-// Stress Test Results (user_events enabled)
-// Threads: 1 - Average Throughput: 285,692 iterations/sec
-// Threads: 5 - Average Throughput: 392,906 iterations/sec
-// Threads: 10 - Average Throughput: 349,334 iterations/sec
-// Threads: 16 - Average Throughput: 297,232 iterations/sec
+// Stress Test Results (user_events enabled at kernel level)
+// Threads: 1 - Average Throughput: 4.5M iterations/sec
+// Threads: 5 - Average Throughput: 21M iterations/sec
+// Threads: 10 - Average Throughput: 33M iterations/sec
+// Threads: 16 - Average Throughput: 42M iterations/sec
 
 use opentelemetry_appender_tracing::layer;
 use opentelemetry_sdk::logs::LoggerProvider;

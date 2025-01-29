@@ -8,10 +8,10 @@
 // Threads: 16 - Average Throughput: 400M iterations/sec
 
 // Stress Test Results (logman is listening)
-// Threads: 1 - Average Throughput: 600K iterations/sec
-// Threads: 5 - Average Throughput: 2.7M iterations/sec
-// Threads: 10 - Average Throughput: 4.1M iterations/sec
-// Threads: 16 - Average Throughput: 5M iterations/sec
+// Threads: 1 - Average Throughput: 4.5M iterations/sec
+// Threads: 5 - Average Throughput: 21M iterations/sec
+// Threads: 10 - Average Throughput: 33M iterations/sec
+// Threads: 16 - Average Throughput: 42M iterations/sec
 // $EtwSessionGuid = (new-object System.Diagnostics.Tracing.EventSource("my-provider-name")).Guid.ToString()`
 // logman create trace OtelETWExampleBasic -o OtelETWExampleBasic.log -p "{$EtwSessionGuid}" -f bincirc -max 1000
 // logman start OtelETWExampleBasic
