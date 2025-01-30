@@ -101,8 +101,8 @@ impl UserEventsExporter {
         for &level in levels.iter() {
             eventheader_provider.register_set(level, keyword);
             if let Some(set) = eventheader_provider.find_set(level.as_int().into(), keyword) {
-                println!("Registered event set for level: {:?} keyword: {} Error: {}, State: {}", level, keyword, set.errno(), set.enabled());
-                event_sets.insert((level.as_int().into(), keyword), set);
+                println!("Registered event set for level: {:?} keyword: {} Error: {}, State: {} Arc_count {}, Arc_ptr {:?}", level, keyword, set.errno(), set.enabled(), Arc::strong_count(&set), Arc::as_ptr(&set));
+                event_sets.insert((level.as_int().into(), keyword), set.clone());
             }
         }
     }

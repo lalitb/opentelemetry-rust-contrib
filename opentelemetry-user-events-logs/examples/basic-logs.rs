@@ -12,7 +12,7 @@ fn init_logger() -> LoggerProvider {
         default_keyword: 1,
         keywords_map: HashMap::new(),
     };
-    let exporter = UserEventsExporter::new("test124", None, exporter_config);
+    let exporter = UserEventsExporter::new("testue", None, exporter_config);
     let reenterant_processor = ReentrantLogProcessor::new(exporter);
     LoggerProvider::builder()
         .with_log_processor(reenterant_processor)
