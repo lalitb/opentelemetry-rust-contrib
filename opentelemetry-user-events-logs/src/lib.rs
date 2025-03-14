@@ -297,7 +297,6 @@ mod tests {
         // Run perf record for duration_secs seconds
         let perf_status = Command::new("sudo")
             .args([
-                &duration_secs.to_string(),
                 "perf",
                 "record",
                 "-o",
