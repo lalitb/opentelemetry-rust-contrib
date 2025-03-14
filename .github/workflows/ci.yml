@@ -34,8 +34,8 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
     - name: Setup-perf-decode
       run: |
-        chmod +x scripts/setup_perf_decode.sh
-        sudo ./scripts/setup_perf_decode.sh
+        chmod +x scripts/setup_perf_decoder.sh
+        sudo ./scripts/setup_perf_decoder.sh
     - name: Test
       run: ./scripts/test.sh
   lint:
