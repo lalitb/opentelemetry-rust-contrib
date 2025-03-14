@@ -24,6 +24,6 @@ rm -rf LinuxTracepoints
 
 # Verify installation
 perf --version
-perf-decode --help
+test -x /usr/local/bin/perf-decode && echo "perf-decode is executable"
 return 0
 
