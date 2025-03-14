@@ -58,7 +58,7 @@ mod tests {
 
         // Start perf recording in a separate thread and emit logs in parallel.
         let perf_thread =
-            std::thread::spawn(|| run_perf_and_decode(5, "user_events:myprovider_L2K1"));
+            std::thread::spawn(|| run_perf_and_decode(20, "user_events:myprovider_L2K1"));
 
         // Give a little time for perf to start recording
         std::thread::sleep(std::time::Duration::from_millis(1000));
