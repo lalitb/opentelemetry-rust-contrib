@@ -100,6 +100,9 @@ mod tests {
             .as_array()
             .expect("Events for perf.data is not an array");
 
+        // display the events for debugging
+        println!("Events: {:#?}", events);
+
         // Find the specific event. Its named providername:eventname format.
         let event = events
             .iter()
