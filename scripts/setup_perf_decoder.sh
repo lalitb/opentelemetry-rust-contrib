@@ -25,4 +25,5 @@ rm -rf LinuxTracepoints
 # Verify installation
 perf --version
 perf-decode --help
+return 0
 
