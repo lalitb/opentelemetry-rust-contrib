@@ -32,6 +32,10 @@ jobs:
     - uses: arduino/setup-protoc@v3
       with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
+    - name: Setup-perf-decode
+      run: |
+        chmod +x scripts/setup_perf_decode.sh
+        sudo ./scripts/setup_perf_decode.sh
     - name: Test
       run: ./scripts/test.sh
   lint:

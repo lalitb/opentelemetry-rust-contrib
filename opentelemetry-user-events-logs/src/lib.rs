@@ -321,8 +321,8 @@ mod tests {
 
         // Decode the performance data and return it directly
         let decode_output = Command::new("sudo")
-        .args(["perf-decode", "./perf.data"])
-        .output()?;
+            .args(["perf-decode", "./perf.data"])
+            .output()?;
 
         if !decode_output.status.success() {
             panic!(
