@@ -25,5 +25,4 @@ rm -rf LinuxTracepoints
 # Verify installation
 perf --version
 test -x /usr/local/bin/perf-decode && echo "perf-decode is executable"
-return 0
-
+exit 0
