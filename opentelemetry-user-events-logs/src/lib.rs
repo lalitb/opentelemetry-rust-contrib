@@ -30,7 +30,7 @@ mod tests {
     #[test]
     fn integration_test_basic() {
         // Run using the below command
-        // sudo -E ~/.cargo/bin/cargo test integration_test_basic -- --nocapture --ignored
+        // sudo ./scripts/setup_perf_decoder.sh && sudo -E ~/.cargo/bin/cargo test integration_test_basic -- --nocapture --ignored
 
         // Basic check if user_events are available
         check_user_events_available().expect("Kernel does not support user_events. Verify your distribution/kernel supports user_events: https://docs.kernel.org/trace/user_events.html.");
@@ -319,21 +319,10 @@ mod tests {
             }
         }
 
-        // Change permissions on perf.data (which is the default file perf records to) to allow reading
-        let chmod_status = Command::new("sudo")
-            .args(["chmod", "uog+r", "./perf.data"])
-            .status()?;
-
-        if !chmod_status.success() {
-            panic!("chmod failed with exit code: {:?}", chmod_status.code());
-        }
-
         // Decode the performance data and return it directly
-        // Note: This tool must be installed on the machine
-        // git clone https://github.com/microsoft/LinuxTracepoints &&
-        // cd LinuxTracepoints && mkdir build && cd build && cmake .. && make &&
-        // sudo cp bin/perf-decode /usr/local/bin &&
-        let decode_output = Command::new("perf-decode").args(["./perf.data"]).output()?;
+        let decode_output = Command::new("sudo")
+        .args(["perf-decode", "./perf.data"])
+        .output()?;
 
         if !decode_output.status.success() {
             panic!(
