@@ -1,7 +1,11 @@
 use base64::{engine::general_purpose, Engine as _};
+<<<<<<< HEAD
 use chrono::{Datelike, Timelike};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 
+=======
+use chrono::{DateTime, Duration as ChronoDuration, Timelike, Utc};
+>>>>>>> bbaaaefa (initial)
 use reqwest::{header, Client};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -10,7 +14,12 @@ use std::time::Duration;
 use thiserror::Error;
 use url::form_urlencoded;
 use uuid::Uuid;
+<<<<<<< HEAD
 use crate::config_service::client::{GenevaConfigClient, MonikerInfo, IngestionGatewayInfo};
+=======
+
+use crate::config_service::client::IngestionGatewayInfo;
+>>>>>>> bbaaaefa (initial)
 
 /// Error types for the Geneva Uploader
 #[derive(Debug, Error)]
@@ -35,21 +44,62 @@ pub struct IngestionResponse {
     pub extra: HashMap<String, Value>,
 }
 
+<<<<<<< HEAD
 
 /// Configuration for the Geneva Uploader
 pub struct GenevaUploaderConfig {
+=======
+/// Supported environments for ingestion
+pub enum GenevaEnvironment {
+    Test,
+    Stage,
+    DiagnosticsProd,
+    RunnersProd,
+    BillingProd,
+    FirstPartyProd,
+    ExternalProd,
+    // Add other environments as needed
+}
+
+impl GenevaEnvironment {
+    /// Maps the environment to the corresponding endpoint URL
+    fn to_endpoint(&self) -> &'static str {
+        match self {
+            Self::Test => "https://test1.diagnostics.monitoring.core.windows.net/",
+            Self::Stage => "https://stage.diagnostics.monitoring.core.windows.net/",
+            Self::DiagnosticsProd => "https://production.diagnostics.monitoring.core.windows.net/",
+            Self::RunnersProd => "https://production.runners.monitoring.core.windows.net/",
+            Self::BillingProd => "https://production.billing.monitoring.core.windows.net/",
+            Self::FirstPartyProd => "https://firstparty.monitoring.windows.net/",
+            Self::ExternalProd => "https://monitoring.windows.net/",
+        }
+    }
+}
+
+/// Configuration for the Geneva Uploader
+pub struct GenevaUploaderConfig {
+    pub moniker: String,
+>>>>>>> bbaaaefa (initial)
     pub namespace: String,
     pub event_name: String,
     pub event_version: String,
     pub source_identity: String,
+<<<<<<< HEAD
     pub environment: String,
     pub schema_ids: Option<String>,
+=======
+    pub environment: GenevaEnvironment,
+    pub schema_ids: Option<String>, // Optional schema IDs
+>>>>>>> bbaaaefa (initial)
 }
 
 /// Client for uploading data to Geneva Ingestion Gateway (GIG)
 pub struct GenevaUploader {
     auth_info: IngestionGatewayInfo,
+<<<<<<< HEAD
     moniker: String,
+=======
+>>>>>>> bbaaaefa (initial)
     config: GenevaUploaderConfig,
     http_client: Client,
 }
@@ -58,22 +108,32 @@ impl GenevaUploader {
     /// Creates a new Geneva Uploader with the provided configuration
     pub fn new(
         auth_info: IngestionGatewayInfo,
+<<<<<<< HEAD
         moniker_info: MonikerInfo,
+=======
+>>>>>>> bbaaaefa (initial)
         config: GenevaUploaderConfig,
     ) -> Result<Self> {
         let http_client = Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
             .map_err(GenevaUploaderError::Http)?;
+<<<<<<< HEAD
     
         Ok(Self {
             auth_info,
             moniker: moniker_info.name,
+=======
+
+        Ok(Self {
+            auth_info,
+>>>>>>> bbaaaefa (initial)
             config,
             http_client,
         })
     }
 
+<<<<<<< HEAD
     /// Constructs a GenevaUploader by calling the GenevaConfigClient
     ///
     /// # Arguments
@@ -94,6 +154,8 @@ impl GenevaUploader {
         GenevaUploader::new(auth_info, moniker_info, uploader_config)
     }
 
+=======
+>>>>>>> bbaaaefa (initial)
     /// Creates the GIG upload URI with required parameters
     fn create_upload_uri(&self, data_size: usize) -> String {
         // Current time and end time (5 minutes later)
@@ -145,7 +207,11 @@ impl GenevaUploader {
         format!(
             "api/v1/ingestion/ingest?endpoint={}&moniker={}&namespace={}&event={}&version={}&sourceUniqueId={}&sourceIdentity={}&startTime={}&endTime={}&format={}&dataSize={}&minLevel={}&schemaIds={}",
             endpoint_param,
+<<<<<<< HEAD
             self.moniker,
+=======
+            self.config.moniker,
+>>>>>>> bbaaaefa (initial)
             self.config.namespace,
             self.config.event_name,
             self.config.event_version,
@@ -160,6 +226,7 @@ impl GenevaUploader {
         )
     }
 
+<<<<<<< HEAD
     // Helper function to extract monitoring endpoint from JWT token
     fn extract_monitoring_endpoint_from_jwt(token: &str) -> Result<String, GenevaUploaderError> {
         let parts: Vec<&str> = token.split('.').collect();
@@ -194,6 +261,8 @@ impl GenevaUploader {
         Ok(endpoint)
     }
 
+=======
+>>>>>>> bbaaaefa (initial)
     /// Uploads data to the ingestion gateway
     ///
     /// # Arguments
