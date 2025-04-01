@@ -1,5 +1,7 @@
 use base64::{engine::general_purpose, Engine as _};
-use chrono::{DateTime, Duration as ChronoDuration, Timelike, Utc};
+use chrono::{Datelike, Timelike};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
+
 use reqwest::{header, Client};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -8,8 +10,7 @@ use std::time::Duration;
 use thiserror::Error;
 use url::form_urlencoded;
 use uuid::Uuid;
-
-use crate::config_service::client::IngestionGatewayInfo;
+use crate::config_service::client::{GenevaConfigClient, MonikerInfo, IngestionGatewayInfo};
 
 /// Error types for the Geneva Uploader
 #[derive(Debug, Error)]
@@ -37,19 +38,18 @@ pub struct IngestionResponse {
 
 /// Configuration for the Geneva Uploader
 pub struct GenevaUploaderConfig {
-    pub moniker: String,
     pub namespace: String,
     pub event_name: String,
     pub event_version: String,
     pub source_identity: String,
     pub environment: String,
-    pub monitoring_endpoint: String, // URL parameter from JWT or config
-    pub schema_ids: Option<String>, // Optional schema IDs
+    pub schema_ids: Option<String>,
 }
 
 /// Client for uploading data to Geneva Ingestion Gateway (GIG)
 pub struct GenevaUploader {
     auth_info: IngestionGatewayInfo,
+    moniker: String,
     config: GenevaUploaderConfig,
     http_client: Client,
 }
@@ -58,18 +58,40 @@ impl GenevaUploader {
     /// Creates a new Geneva Uploader with the provided configuration
     pub fn new(
         auth_info: IngestionGatewayInfo,
+        moniker_info: MonikerInfo,
         config: GenevaUploaderConfig,
     ) -> Result<Self> {
         let http_client = Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
             .map_err(GenevaUploaderError::Http)?;
-
+    
         Ok(Self {
             auth_info,
+            moniker: moniker_info.name,
             config,
             http_client,
         })
+    }
+
+    /// Constructs a GenevaUploader by calling the GenevaConfigClient
+    ///
+    /// # Arguments
+    /// * `config_client` - Initialized GenevaConfigClient
+    /// * `uploader_config` - Static config (namespace, event, version, etc.)
+    ///
+    /// # Returns
+    /// * `Result<GenevaUploader>` with authenticated client and resolved moniker/endpoint
+    pub async fn from_config_client(
+        config_client: &GenevaConfigClient,
+        uploader_config: GenevaUploaderConfig,
+    ) -> Result<Self> {
+        let (auth_info, moniker_info) = config_client
+            .get_ingestion_info()
+            .await
+            .map_err(|e| GenevaUploaderError::Other(format!("GCS error: {}", e)))?;
+
+        GenevaUploader::new(auth_info, moniker_info, uploader_config)
     }
 
     /// Creates the GIG upload URI with required parameters
@@ -123,7 +145,7 @@ impl GenevaUploader {
         format!(
             "api/v1/ingestion/ingest?endpoint={}&moniker={}&namespace={}&event={}&version={}&sourceUniqueId={}&sourceIdentity={}&startTime={}&endTime={}&format={}&dataSize={}&minLevel={}&schemaIds={}",
             endpoint_param,
-            self.config.moniker,
+            self.moniker,
             self.config.namespace,
             self.config.event_name,
             self.config.event_version,
