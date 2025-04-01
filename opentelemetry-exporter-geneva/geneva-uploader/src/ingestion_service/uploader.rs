@@ -45,6 +45,7 @@ pub struct IngestionResponse {
 }
 
 <<<<<<< HEAD
+<<<<<<< HEAD
 
 /// Configuration for the Geneva Uploader
 pub struct GenevaUploaderConfig {
@@ -75,6 +76,8 @@ impl GenevaEnvironment {
         }
     }
 }
+=======
+>>>>>>> 7e1a12ab (upstream)
 
 /// Configuration for the Geneva Uploader
 pub struct GenevaUploaderConfig {
@@ -85,10 +88,15 @@ pub struct GenevaUploaderConfig {
     pub event_version: String,
     pub source_identity: String,
 <<<<<<< HEAD
+<<<<<<< HEAD
     pub environment: String,
     pub schema_ids: Option<String>,
 =======
     pub environment: GenevaEnvironment,
+=======
+    pub environment: String,
+    pub monitoring_endpoint: String, // URL parameter from JWT or config
+>>>>>>> 7e1a12ab (upstream)
     pub schema_ids: Option<String>, // Optional schema IDs
 >>>>>>> bbaaaefa (initial)
 }
@@ -227,6 +235,9 @@ impl GenevaUploader {
     }
 
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> 7e1a12ab (upstream)
     // Helper function to extract monitoring endpoint from JWT token
     fn extract_monitoring_endpoint_from_jwt(token: &str) -> Result<String, GenevaUploaderError> {
         let parts: Vec<&str> = token.split('.').collect();
@@ -261,8 +272,11 @@ impl GenevaUploader {
         Ok(endpoint)
     }
 
+<<<<<<< HEAD
 =======
 >>>>>>> bbaaaefa (initial)
+=======
+>>>>>>> 7e1a12ab (upstream)
     /// Uploads data to the ingestion gateway
     ///
     /// # Arguments
