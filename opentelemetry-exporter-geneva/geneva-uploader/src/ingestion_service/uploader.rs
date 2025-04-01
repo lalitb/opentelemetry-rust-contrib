@@ -34,32 +34,6 @@ pub struct IngestionResponse {
     pub extra: HashMap<String, Value>,
 }
 
-/// Supported environments for ingestion
-pub enum GenevaEnvironment {
-    Test,
-    Stage,
-    DiagnosticsProd,
-    RunnersProd,
-    BillingProd,
-    FirstPartyProd,
-    ExternalProd,
-    // Add other environments as needed
-}
-
-impl GenevaEnvironment {
-    /// Maps the environment to the corresponding endpoint URL
-    fn to_endpoint(&self) -> &'static str {
-        match self {
-            Self::Test => "https://test1.diagnostics.monitoring.core.windows.net/",
-            Self::Stage => "https://stage.diagnostics.monitoring.core.windows.net/",
-            Self::DiagnosticsProd => "https://production.diagnostics.monitoring.core.windows.net/",
-            Self::RunnersProd => "https://production.runners.monitoring.core.windows.net/",
-            Self::BillingProd => "https://production.billing.monitoring.core.windows.net/",
-            Self::FirstPartyProd => "https://firstparty.monitoring.windows.net/",
-            Self::ExternalProd => "https://monitoring.windows.net/",
-        }
-    }
-}
 
 /// Configuration for the Geneva Uploader
 pub struct GenevaUploaderConfig {
@@ -68,7 +42,8 @@ pub struct GenevaUploaderConfig {
     pub event_name: String,
     pub event_version: String,
     pub source_identity: String,
-    pub environment: GenevaEnvironment,
+    pub environment: String,
+    pub monitoring_endpoint: String, // URL parameter from JWT or config
     pub schema_ids: Option<String>, // Optional schema IDs
 }
 
@@ -161,6 +136,40 @@ impl GenevaUploader {
             2, // Min level
             schema_ids
         )
+    }
+
+    // Helper function to extract monitoring endpoint from JWT token
+    fn extract_monitoring_endpoint_from_jwt(token: &str) -> Result<String, GenevaUploaderError> {
+        let parts: Vec<&str> = token.split('.').collect();
+        if parts.len() != 3 {
+            return Err(GenevaUploaderError::Other("Invalid JWT token format".to_string()));
+        }
+    
+        // Decode the payload
+        let payload = parts[1];
+        let payload = match payload.len() % 4 {
+            0 => payload.to_string(),
+            2 => format!("{}==", payload),
+            3 => format!("{}=", payload),
+            _ => payload.to_string(),
+        };
+    
+        let decoded = general_purpose::URL_SAFE_NO_PAD.decode(payload)
+            .map_err(|e| GenevaUploaderError::Other(format!("Failed to decode JWT: {}", e)))?;
+        
+        let decoded_str = String::from_utf8(decoded)
+            .map_err(|e| GenevaUploaderError::Other(format!("Invalid UTF-8 in JWT: {}", e)))?;
+    
+        // Parse as JSON and extract the Endpoint claim
+        let payload_json: Value = serde_json::from_str(&decoded_str)
+            .map_err(|e| GenevaUploaderError::Json(e))?;
+            
+        let endpoint = payload_json["Endpoint"]
+            .as_str()
+            .ok_or_else(|| GenevaUploaderError::Other("No Endpoint claim in JWT token".to_string()))?
+            .to_string();
+            
+        Ok(endpoint)
     }
 
     /// Uploads data to the ingestion gateway
