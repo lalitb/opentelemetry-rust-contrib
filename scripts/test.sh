@@ -8,5 +8,3 @@ cargo test --workspace --all-features --tests
 echo "Running doctests for all packages in workspace with --all-features"
 cargo test --workspace --all-features --doc
 
-echo "Running user_events tests"
-sudo -E ~/.cargo/bin/cargo test --manifest-path=opentelemetry-user-events-logs/Cargo.toml -- --nocapture --ignored

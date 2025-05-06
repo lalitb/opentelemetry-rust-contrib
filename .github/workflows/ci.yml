@@ -58,7 +58,7 @@ jobs:
       with:
         repo-token: ${{ secrets.GITHUB_TOKEN }}
     - name: Setup-perf-decode
-      if: ${{ matrix.os != 'windows-latest' }}
+      if: ${{ matrix.os == 'ubuntu-latest' }}
       run: |
         chmod +x scripts/setup_perf_decoder.sh
         sudo ./scripts/setup_perf_decoder.sh
@@ -69,6 +69,9 @@ jobs:
     - name: Test (Unix)
       if: ${{ matrix.os != 'windows-latest'}}
       run: bash ./scripts/test.sh
+    - name: Test user_events
+      if: ${{ matrix.os == 'ubuntu-latest'}}
+      run: bash ./scripts/test_user_events.sh
   lint:
     strategy:
       matrix:
