@@ -2,15 +2,33 @@
 
 ## vNext
 
+- Enhanced validation for the provider name in `with_user_event_exporter(provider_name)`:
+  - Empty provider names are now disallowed.
+
+## v0.12.0
+
+- Added support for Populating Cloud RoleName, RoleInstance from Resource's
+  "service.name" and "service.instance.id" attributes respectively.
+- Make exporter reentrant-safe by removing logs that could be bridged back
+  to itself.
+- Export SeverityNumber from OTel Severity, not EventHeader severity. (They move
+  in opposite direction)
+- Exporter now unregisters the `Provider` on `shutdown()`.
+  [#221](https://github.com/open-telemetry/opentelemetry-rust-contrib/pull/221)
+- `with_user_event_exporter` method on `LoggerProviderBuilder` renamed to
+  `with_user_events_exporter`.
+
+## v0.11.0
+
 - Fixed contention in `event_enabled()` check and `export()` path, by caching the
   EventSets, addressing
   [159](https://github.com/open-telemetry/opentelemetry-rust-contrib/issues/159)
-- //TODO:(actually do this after upstream release) Shutdown now de-registers all the EventSets created
 - Added validation for the provider name in `with_user_event_exporter(provider_name)`.
   The provider name must:
   - Be less than 234 characters.
   - Contain only ASCII letters, digits, and the underscore (`'_'`) character.
 - Added support for TraceId,SpanId
+- Bump opentelemetry and opentelemetry_sdk versions to 0.29
 
 ## v0.10.0
 
@@ -59,13 +77,13 @@
 - **BREAKING** Decouple Exporter creation with the Reentrant processor [#82](https://github.com/open-telemetry/opentelemetry-rust-contrib/pull/82)
   The UserEventsExporter is now created separately and passed to the ReentrantProcessor. Update your application code from:
   ```rust
-    let reenterant_processor = ReentrantLogProcessor::new("test", None, exporter_config);
+    let reentrant_processor = ReentrantLogProcessor::new("test", None, exporter_config);
   ```
   to:
 
   ```rust
       let exporter = UserEventsExporter::new("test", None, exporter_config);
-      let reenterant_processor = ReentrantLogProcessor::new(exporter);
+      let reentrant_processor = ReentrantLogProcessor::new(exporter);
   ``
 - Bump opentelemetry and opentelemetry_sdk versions to 0.24
 

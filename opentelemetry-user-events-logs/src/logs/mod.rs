@@ -11,6 +11,7 @@ pub trait UserEventsLoggerProviderBuilderExt {
     /// Adds a user event exporter to the logger provider builder with the given provider name.
     ///
     /// The provider name must:
+    /// - Not be empty.
     /// - Be less than 234 characters.
     /// - Contain only ASCII letters, digits, and the underscore (`'_'`) character.
     /// - Be short, human-readable, and unique enough to avoid conflicts with other provider names.
@@ -32,18 +33,18 @@ pub trait UserEventsLoggerProviderBuilderExt {
     /// perf tool can be used to record events from the tracepoints.
     /// For example the following will capture level 2 (Error) and 3(Warning) events:
     /// perf record -e user_events:myprovider_L2K1,user_events:myprovider_L3K1
-    fn with_user_event_exporter(self, provider_name: &str) -> Self;
+    fn with_user_events_exporter(self, provider_name: &str) -> Self;
 }
 
 impl UserEventsLoggerProviderBuilderExt for LoggerProviderBuilder {
-    fn with_user_event_exporter(self, provider_name: &str) -> Self {
+    fn with_user_events_exporter(self, provider_name: &str) -> Self {
         match UserEventsExporter::new(provider_name) {
             Ok(exporter) => {
-                let reenterant_processor = ReentrantLogProcessor::new(exporter);
-                self.with_log_processor(reenterant_processor)
+                let reentrant_processor = ReentrantLogProcessor::new(exporter);
+                self.with_log_processor(reentrant_processor)
             }
             Err(e) => {
-                otel_warn!(name: "User_Events.Exporter.CreationFailed", reason = e);
+                otel_warn!(name: "User_Events.Exporter.CreationFailed", reason = &e);
                 self
             }
         }
