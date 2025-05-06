@@ -56,7 +56,7 @@ jobs:
       run: rustup set profile minimal
     - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
       with:
-      repo-token: ${{ secrets.GITHUB_TOKEN }}
+        repo-token: ${{ secrets.GITHUB_TOKEN }}
     - name: Setup-perf-decode
       if: ${{ matrix.os != 'windows-latest' }}
       run: |
