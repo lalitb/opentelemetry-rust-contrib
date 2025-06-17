@@ -1,4 +1,10 @@
 use lz4_flex::block::{compress_into, get_maximum_output_size};
+use std::cell::RefCell;
+
+thread_local! {
+    // Thread-local buffer pool to avoid repeated allocations
+    static COMPRESSION_BUFFER: RefCell<Vec<u8>> = RefCell::new(Vec::new());
+}
 
 /// Compresses input data in 64 KiB chunks using LZ4, writing each chunk's compressed data to a single
 /// pre-allocated buffer. Each chunk in the output is prefixed by a 4-byte (little-endian) length header
@@ -60,22 +66,22 @@ pub(crate) fn lz4_chunked_compression(
         let header_offset = output.len();
         output.extend_from_slice(&[0u8; 4]); // Placeholder for length
 
-        // Reserve worst-case space for compressed data
-        let data_offset = output.len();
-        output.resize(data_offset + max_chunk_compressed, 0);
-
-        // Compress directly into the reserved slice
-        let compressed_size = compress_into(
-            chunk,
-            &mut output[data_offset..data_offset + max_chunk_compressed],
-        )?;
+        // Use thread-local buffer pool to avoid repeated allocations
+        let compressed_size = COMPRESSION_BUFFER.with(|buffer| {
+            let mut buffer = buffer.borrow_mut();
+            buffer.resize(max_chunk_compressed, 0);
+            compress_into(chunk, &mut *buffer)
+        })?;
 
         // Write the actual compressed length as little-endian u32
         let compressed_size_le = (compressed_size as u32).to_le_bytes();
         output[header_offset..header_offset + 4].copy_from_slice(&compressed_size_le);
-        // Truncate output to actual size (header + compressed)
-        // TODO - This can be optimized further without needing to resize and truncate during each iteration.
-        output.truncate(data_offset + compressed_size);
+        
+        // Append only the compressed data
+        COMPRESSION_BUFFER.with(|buffer| {
+            let buffer = buffer.borrow();
+            output.extend_from_slice(&buffer[..compressed_size]);
+        });
 
         offset = end;
     }

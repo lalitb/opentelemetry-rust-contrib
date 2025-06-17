@@ -145,8 +145,20 @@ impl GenevaUploader {
         // Create a source unique ID - using a UUID to ensure uniqueness
         let source_unique_id = Uuid::new_v4();
 
-        // Create the query string
-        let mut query = String::with_capacity(512); // Preallocate enough space for the query string (decided based on expected size)
+        // Create the query string with better capacity estimation
+        let estimated_size = 200 + // Base URL and parameter names
+            encoded_monitoring_endpoint.len() +
+            moniker.len() +
+            self.config.namespace.len() +
+            event_name.len() +
+            event_version.len() +
+            36 + // UUID length
+            encoded_source_identity.len() +
+            60 + // Two timestamps
+            20 + // data_size and minLevel
+            self.config.schema_ids.len();
+            
+        let mut query = String::with_capacity(estimated_size);
         write!(&mut query, "api/v1/ingestion/ingest?endpoint={}&moniker={}&namespace={}&event={}&version={}&sourceUniqueId={}&sourceIdentity={}&startTime={}&endTime={}&format=centralbond/lz4hc&dataSize={}&minLevel={}&schemaIds={}",
             encoded_monitoring_endpoint,
             moniker,

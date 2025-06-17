@@ -15,11 +15,6 @@ type BatchValue = (CentralSchemaEntry, Vec<EncodedRow>);
 type LogBatches = HashMap<BatchKey, BatchValue>;
 
 /// Encoder to write OTLP payload in bond form.
-pub struct OtlpEncoder {
-    // TODO - limit cache size or use LRU eviction, and/or add feature flag for caching
-    schema_cache: SchemaCache,
-}
-
 #[derive(Clone, Debug)]
 struct FieldInfo {
     name: String,
@@ -27,10 +22,15 @@ struct FieldInfo {
     order_id: u16,
 }
 
+pub struct OtlpEncoder {
+    // TODO - limit cache size or use LRU eviction, and/or add feature flag for caching
+    schema_cache: SchemaCache,
+}
+
 impl OtlpEncoder {
     pub fn new() -> Self {
         OtlpEncoder {
-            schema_cache: Arc::new(RwLock::new(HashMap::new())),
+            schema_cache: Arc::new(RwLock::new(HashMap::with_capacity(32))),
         }
     }
 
@@ -44,7 +44,9 @@ impl OtlpEncoder {
     {
         use std::collections::HashMap;
 
-        let mut batches: LogBatches = HashMap::new();
+        let mut batches: LogBatches = HashMap::with_capacity(8);
+
+        // TODO: Integrate compression at the batch level after blobs are created
 
         for log_record in logs {
             // 1. Get schema
@@ -54,19 +56,19 @@ impl OtlpEncoder {
 
             // 2. Encode row
             let row_buffer = self.write_row_data(log_record, &field_info);
-            let event_name = if log_record.event_name.is_empty() {
-                "Log".to_string()
+            let event_name: &str = if log_record.event_name.is_empty() {
+                "Log"
             } else {
-                log_record.event_name.clone()
+                &log_record.event_name
             };
             let level = log_record.severity_number as u8;
 
             // 3. Insert into batches - Key is (schema_id, event_name)
             batches
-                .entry((schema_id, event_name.clone()))
+                .entry((schema_id, event_name.to_owned()))
                 .or_insert_with(|| (schema_entry, Vec::new()))
                 .1
-                .push((event_name, level, row_buffer));
+                .push((event_name.to_owned(), level, row_buffer));
         }
 
         // 4. Encode blobs (one per schema AND event_name combination)
@@ -158,7 +160,8 @@ impl OtlpEncoder {
         let mut hasher = DefaultHasher::new();
 
         // Sort fields by name for consistent schema ID
-        let mut sorted_fields = fields.to_vec();
+        // Avoid clone: sort a slice reference
+        let mut sorted_fields: Vec<_> = fields.iter().collect();
         sorted_fields.sort_by(|a, b| a.0.cmp(&b.0));
 
         for (name, type_id) in sorted_fields {
@@ -191,7 +194,8 @@ impl OtlpEncoder {
         }
 
         // Create new schema
-        let mut sorted_specs = field_specs.clone();
+        // Avoid clone: sort a slice reference
+        let mut sorted_specs: Vec<_> = field_specs.iter().collect();
         sorted_specs.sort_by(|a, b| a.0.cmp(&b.0));
 
         let field_defs: Vec<(&str, u8, u16)> = sorted_specs
@@ -206,13 +210,14 @@ impl OtlpEncoder {
         let field_info: Vec<FieldInfo> = field_defs
             .iter()
             .map(|(name, type_id, order_id)| FieldInfo {
-                name: name.to_string(),
+                name: (*name).to_string(),
                 type_id: *type_id,
                 order_id: *order_id,
             })
             .collect();
 
-        // Cache the schema and field info
+        // TODO: Use LRU cache for schema_cache to limit memory usage
+
         {
             let mut cache = self.schema_cache.write().unwrap();
             cache.insert(schema_id, (schema.clone(), field_info.clone()));
@@ -233,13 +238,15 @@ impl OtlpEncoder {
 
     /// Write row data directly from LogRecord
     fn write_row_data(&self, log: &LogRecord, field_info: &[FieldInfo]) -> Vec<u8> {
-        let mut buffer = Vec::with_capacity(1024);
+        // Better capacity estimation based on typical log size
+        let mut buffer = Vec::with_capacity(2048);
 
-        // Sort by order_id to write in schema order
-        let mut sorted_fields = field_info.to_vec();
-        sorted_fields.sort_by_key(|f| f.order_id);
+        // Write fields in schema order without clone
+        let mut sorted_indices: Vec<_> = (0..field_info.len()).collect();
+        sorted_indices.sort_by_key(|&i| field_info[i].order_id);
 
-        for field in sorted_fields {
+        for &i in &sorted_indices {
+            let field = &field_info[i];
             match field.name.as_str() {
                 "env_name" => BondWriter::write_string(&mut buffer, "TestEnv"), // TODO - placeholder for actual env name
                 "env_ver" => BondWriter::write_string(&mut buffer, "4.0"), // TODO - placeholder for actual env name
@@ -292,6 +299,8 @@ impl OtlpEncoder {
                 }
             }
         }
+
+        // TODO: Reuse buffer for multiple rows to reduce allocations
 
         buffer
     }
