@@ -223,8 +223,8 @@ async fn init_client() -> Result<(GenevaClient, Option<String>), Box<dyn std::er
     }
 }
 
-#[tokio::main(flavor = "current_thread")]
-//#[tokio::main(flavor = "multi_thread")]
+//#[tokio::main(flavor = "current_thread")]
+#[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     let concurrency = args
