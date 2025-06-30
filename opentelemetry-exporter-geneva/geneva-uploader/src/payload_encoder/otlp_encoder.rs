@@ -4,10 +4,10 @@ use chrono::{TimeZone, Utc};
 use opentelemetry_proto::tonic::common::v1::any_value::Value;
 use opentelemetry_proto::tonic::logs::v1::LogRecord;
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-type SchemaCache = Arc<RwLock<HashMap<u64, (BondEncodedSchema, [u8; 16], Vec<FieldDef>)>>>;
+type SchemaCache = Arc<RwLock<HashMap<u64, Arc<CentralSchemaEntry>>>>;
 
 const FIELD_ENV_NAME: &str = "env_name";
 const FIELD_ENV_VER: &str = "env_ver";
@@ -23,17 +23,7 @@ const FIELD_BODY: &str = "body";
 
 /// Event group for flattened structure - contains events for a single event_name
 struct EventGroup {
-    schema_ids: HashSet<u64>,
     events: Vec<CentralEventEntry>,
-}
-
-impl EventGroup {
-    fn new() -> Self {
-        Self {
-            schema_ids: HashSet::new(),
-            events: Vec::new(),
-        }
-    }
 }
 
 /// Encoder to write OTLP payload in bond form.
@@ -58,135 +48,164 @@ impl OtlpEncoder {
     where
         I: Iterator<Item = &'a opentelemetry_proto::tonic::logs::v1::LogRecord>,
     {
-        use std::collections::HashMap;
-
-        // Flattened structure: global schema storage + simple event groups
-        let mut global_schemas: HashMap<u64, CentralSchemaEntry> = HashMap::new();
+        // Group events by event_name
         let mut event_groups: HashMap<String, EventGroup> = HashMap::new();
 
         for log_record in logs {
-            // 1. Get schema
-            let field_specs = self.determine_fields(log_record);
-            let schema_id = Self::calculate_schema_id(&field_specs);
-            let (schema_entry, field_info) = self.get_or_create_schema(schema_id, field_specs);
+            // 1. Get schema and encode row
+            let (schema_id, row_buffer) = self.process_log_record(log_record);
 
-            // 2. Encode row
-            let row_buffer = self.write_row_data(log_record, &field_info);
             let event_name = if log_record.event_name.is_empty() {
                 "Log".to_string()
             } else {
                 log_record.event_name.clone()
             };
-            let level = log_record.severity_number as u8;
 
-            // 3. Store schema globally (deduplicated)
-            global_schemas.entry(schema_id).or_insert(schema_entry);
-
-            // 4. Group by event_name
+            // 2. Add to appropriate event group
             let group = event_groups
                 .entry(event_name.clone())
-                .or_insert_with(EventGroup::new);
-
-            // Track schema usage in this group
-            group.schema_ids.insert(schema_id);
+                .or_insert_with(|| EventGroup { events: Vec::new() });
 
             // Add event
             group.events.push(CentralEventEntry {
                 schema_id,
-                level,
+                level: log_record.severity_number as u8,
                 event_name,
                 row: row_buffer,
             });
         }
 
-        // 5. Create one blob per event_name
-        let mut blobs = Vec::new();
-        for (event_name, group) in event_groups {
-            // Collect schemas used by this event group (clone only when needed)
-            let schemas_list: Vec<CentralSchemaEntry> = group
-                .schema_ids
-                .iter()
-                .filter_map(|&id| global_schemas.get(&id))
-                .cloned()  // Clone only when building the final blob
-                .collect();
-            let events_len = group.events.len();
+        // 3. Create one blob per event_name
+        event_groups
+            .into_iter()
+            .map(|(event_name, group)| {
+                let events_len = group.events.len();
 
-            let blob = CentralBlob {
-                version: 1,
-                format: 2,
-                metadata: metadata.to_string(),
-                schemas: schemas_list,
-                events: group.events,
-            };
-            let bytes = blob.to_bytes();
+                // Collect unique schemas for this event group
+                let unique_schema_ids: Vec<u64> = {
+                    let mut ids: Vec<_> = group.events.iter().map(|e| e.schema_id).collect();
+                    ids.sort_unstable();
+                    ids.dedup();
+                    ids
+                };
 
-            // Each blob represents one event_name
-            blobs.push((0, event_name, bytes, events_len));
-        }
+                // Get schemas from cache (already Arc'd, so cheap to clone)
+                let schemas: Vec<CentralSchemaEntry> = {
+                    let cache = self.schema_cache.read().unwrap();
+                    unique_schema_ids
+                        .iter()
+                        .filter_map(|&id| cache.get(&id).map(|arc| (**arc).clone()))
+                        .collect()
+                };
 
-        blobs
+                let blob = CentralBlob {
+                    version: 1,
+                    format: 2,
+                    metadata: metadata.to_string(),
+                    schemas,
+                    events: group.events,
+                };
+
+                (0, event_name, blob.to_bytes(), events_len)
+            })
+            .collect()
     }
 
-    /// Determine which fields are present in the LogRecord
-    fn determine_fields(&self, log: &LogRecord) -> Vec<FieldDef> {
+    /// Process a log record - determine schema and encode row data
+    fn process_log_record(&self, log: &LogRecord) -> (u64, Vec<u8>) {
+        // Pre-calculate all field information once
+        let fields = self.build_field_definitions(log);
+        let schema_id = Self::calculate_schema_id(&fields);
+
+        // Get or create schema (using Arc for cheap cloning)
+        self.ensure_schema_cached(schema_id, &fields);
+
+        // Encode row data
+        let row_buffer = self.encode_row_data(log, &fields);
+
+        (schema_id, row_buffer)
+    }
+
+    /// Build field definitions for a log record
+    fn build_field_definitions(&self, log: &LogRecord) -> Vec<FieldDef> {
         // Pre-allocate with estimated capacity to avoid reallocations
         let estimated_capacity = 7 + 4 + log.attributes.len();
         let mut fields = Vec::with_capacity(estimated_capacity);
-        fields.push((Cow::Borrowed(FIELD_ENV_NAME), BondDataType::BT_STRING as u8));
-        fields.push((FIELD_ENV_VER.into(), BondDataType::BT_STRING as u8));
-        fields.push((FIELD_TIMESTAMP.into(), BondDataType::BT_STRING as u8));
-        fields.push((FIELD_ENV_TIME.into(), BondDataType::BT_STRING as u8));
+        let mut field_id = 1u16;
+        // Helper to add field
+        let mut add_field = |name: &'static str, type_id: u8| {
+            fields.push(FieldDef {
+                name: Cow::Borrowed(name),
+                type_id,
+                field_id,
+            });
+            field_id += 1;
+        };
+
+        add_field(FIELD_ENV_NAME, BondDataType::BT_STRING as u8);
+        add_field(FIELD_ENV_VER, BondDataType::BT_STRING as u8);
+        add_field(FIELD_TIMESTAMP, BondDataType::BT_STRING as u8);
+        add_field(FIELD_ENV_TIME, BondDataType::BT_STRING as u8);
 
         // Part A extension - Conditional fields
         if !log.trace_id.is_empty() {
-            fields.push((FIELD_TRACE_ID.into(), BondDataType::BT_STRING as u8));
+            add_field(FIELD_TRACE_ID, BondDataType::BT_STRING as u8);
         }
         if !log.span_id.is_empty() {
-            fields.push((FIELD_SPAN_ID.into(), BondDataType::BT_STRING as u8));
+            add_field(FIELD_SPAN_ID, BondDataType::BT_STRING as u8);
         }
         if log.flags != 0 {
-            fields.push((FIELD_TRACE_FLAGS.into(), BondDataType::BT_INT32 as u8));
+            add_field(FIELD_TRACE_FLAGS, BondDataType::BT_INT32 as u8);
         }
 
         // Part B - Core log fields
         if !log.event_name.is_empty() {
-            fields.push((FIELD_NAME.into(), BondDataType::BT_STRING as u8));
+            add_field(FIELD_NAME, BondDataType::BT_STRING as u8);
         }
-        fields.push((FIELD_SEVERITY_NUMBER.into(), BondDataType::BT_INT32 as u8));
+        add_field(FIELD_SEVERITY_NUMBER, BondDataType::BT_INT32 as u8);
         if !log.severity_text.is_empty() {
-            fields.push((FIELD_SEVERITY_TEXT.into(), BondDataType::BT_STRING as u8));
+            add_field(FIELD_SEVERITY_TEXT, BondDataType::BT_STRING as u8);
         }
         if let Some(body) = &log.body {
             if let Some(Value::StringValue(_)) = &body.value {
                 // Only included in schema when body is a string value
-                fields.push((FIELD_BODY.into(), BondDataType::BT_STRING as u8));
+                add_field(FIELD_BODY, BondDataType::BT_STRING as u8);
             }
             //TODO - handle other body types
         }
 
         // Part C - Dynamic attributes
-        for attr in &log.attributes {
-            if let Some(val) = attr.value.as_ref().and_then(|v| v.value.as_ref()) {
-                let type_id = match val {
-                    Value::StringValue(_) => BondDataType::BT_STRING as u8,
-                    Value::IntValue(_) => BondDataType::BT_INT32 as u8,
-                    Value::DoubleValue(_) => BondDataType::BT_FLOAT as u8, // TODO - using float for now
-                    Value::BoolValue(_) => BondDataType::BT_INT32 as u8, // representing bool as int
-                    _ => continue,
-                };
-                fields.push((attr.key.clone().into(), type_id));
-            }
-        }
-        fields.sort_by(|a, b| a.0.cmp(&b.0)); // Sort fields by name consistent schema ID generation
-        fields
-            .into_iter()
-            .enumerate()
-            .map(|(i, (name, type_id))| FieldDef {
-                name,
-                type_id,
-                field_id: (i + 1) as u16,
+        // Dynamic attributes - collect and sort
+        let mut attr_fields: Vec<_> = log
+            .attributes
+            .iter()
+            .filter_map(|attr| {
+                attr.value.as_ref()?.value.as_ref().map(|val| {
+                    let type_id = match val {
+                        Value::StringValue(_) => BondDataType::BT_STRING as u8,
+                        Value::IntValue(_) => BondDataType::BT_INT32 as u8,
+                        Value::DoubleValue(_) => BondDataType::BT_FLOAT as u8, // TODO - using float for now
+                        Value::BoolValue(_) => BondDataType::BT_INT32 as u8, // representing bool as int
+                        _ => return None,
+                    };
+                    Some((attr.key.clone(), type_id))
+                })
             })
-            .collect()
+            .flatten()
+            .collect();
+        attr_fields.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // Add sorted attributes
+        for (name, type_id) in attr_fields {
+            fields.push(FieldDef {
+                name: Cow::Owned(name),
+                type_id,
+                field_id,
+            });
+            field_id += 1;
+        }
+
+        fields
     }
 
     /// Calculate schema ID from field specifications
@@ -204,59 +223,34 @@ impl OtlpEncoder {
         hasher.finish()
     }
 
-    /// Get or create schema with field ordering information
-    fn get_or_create_schema(
-        &self,
-        schema_id: u64,
-        field_info: Vec<FieldDef>,
-    ) -> (CentralSchemaEntry, Vec<FieldDef>) {
-        // Check cache first
-        if let Some((schema, schema_md5, field_info)) =
-            self.schema_cache.read().unwrap().get(&schema_id)
-        {
-            return (
-                CentralSchemaEntry {
-                    id: schema_id,
-                    md5: *schema_md5,
-                    schema: schema.clone(),
-                },
-                field_info.clone(),
-            );
+    /// Ensure schema is in cache
+    fn ensure_schema_cached(&self, schema_id: u64, fields: &[FieldDef]) {
+        let cache = self.schema_cache.read().unwrap();
+        if cache.contains_key(&schema_id) {
+            return;
         }
+        drop(cache);
 
-        let schema =
-            BondEncodedSchema::from_fields("OtlpLogRecord", "telemetry", field_info.clone()); //TODO - use actual struct name and namespace
-
-        let schema_bytes = schema.as_bytes();
-        let schema_md5 = md5::compute(schema_bytes).0;
-        // Cache the schema and field info
-        {
-            let mut cache = self.schema_cache.write().unwrap();
-            // TODO: Refactor to eliminate field_info duplication in cache
-            // The field information (name, type_id, order) is already stored in BondEncodedSchema's
-            // DynamicSchema.fields vector. We should:
-            // 1. Ensure DynamicSchema maintains fields in sorted order
-            // 2. Add a method to BondEncodedSchema to iterate fields for row encoding
-            // 3. Remove field_info from cache tuple to reduce memory usage and cloning overhead
-            // This would require updating write_row_data() to work with DynamicSchema fields directly
-            cache.insert(schema_id, (schema.clone(), schema_md5, field_info.clone()));
-        }
+        // Create schema
+        let schema = BondEncodedSchema::from_fields("OtlpLogRecord", "telemetry", fields.to_vec());
 
         let schema_bytes = schema.as_bytes();
         let schema_md5 = md5::compute(schema_bytes).0;
 
-        (
-            CentralSchemaEntry {
-                id: schema_id,
-                md5: schema_md5,
-                schema,
-            },
-            field_info,
-        )
+        let schema_entry = Arc::new(CentralSchemaEntry {
+            id: schema_id,
+            md5: schema_md5,
+            schema,
+        });
+
+        self.schema_cache
+            .write()
+            .unwrap()
+            .insert(schema_id, schema_entry);
     }
 
-    /// Write row data directly from LogRecord
-    fn write_row_data(&self, log: &LogRecord, sorted_fields: &[FieldDef]) -> Vec<u8> {
+    /// Encode row data directly from LogRecord and field definitions
+    fn encode_row_data(&self, log: &LogRecord, sorted_fields: &[FieldDef]) -> Vec<u8> {
         let mut buffer = Vec::with_capacity(sorted_fields.len() * 50); //TODO - estimate better
 
         for field in sorted_fields {
