@@ -45,17 +45,17 @@ impl OtlpEncoder {
     {
         use std::collections::HashMap;
 
-        let mut schemas: HashMap<u64, CentralSchemaEntry> = HashMap::new();
-        let mut events: Vec<CentralEventEntry> = Vec::new();
+        // Group by event_name
+        let mut event_groups: HashMap<
+            String,
+            (HashMap<u64, CentralSchemaEntry>, Vec<CentralEventEntry>),
+        > = HashMap::new();
 
         for log_record in logs {
             // 1. Get schema
             let field_specs = self.determine_fields(log_record);
             let schema_id = Self::calculate_schema_id(&field_specs);
             let (schema_entry, field_info) = self.get_or_create_schema(schema_id, field_specs);
-
-            // Add schema to the collection if not already present
-            schemas.entry(schema_id).or_insert(schema_entry);
 
             // 2. Encode row
             let row_buffer = self.write_row_data(log_record, &field_info);
@@ -66,8 +66,16 @@ impl OtlpEncoder {
             };
             let level = log_record.severity_number as u8;
 
-            // 3. Add event directly to events list (no grouping)
-            events.push(CentralEventEntry {
+            // 3. Group by event_name
+            let group = event_groups
+                .entry(event_name.clone())
+                .or_insert_with(|| (HashMap::new(), Vec::new()));
+
+            // Add schema if not already present for this event_name
+            group.0.entry(schema_id).or_insert(schema_entry);
+
+            // Add event
+            group.1.push(CentralEventEntry {
                 schema_id,
                 level,
                 event_name,
@@ -75,11 +83,12 @@ impl OtlpEncoder {
             });
         }
 
-        // 4. Create single blob with all schemas and all events
-        if !events.is_empty() {
+        // 4. Create one blob per event_name
+        let mut blobs = Vec::new();
+        for (event_name, (schemas, events)) in event_groups {
             let schemas_list: Vec<CentralSchemaEntry> = schemas.into_values().collect();
             let events_len = events.len();
-            
+
             let blob = CentralBlob {
                 version: 1,
                 format: 2,
@@ -88,13 +97,12 @@ impl OtlpEncoder {
                 events,
             };
             let bytes = blob.to_bytes();
-            
-            // Return single blob entry
-            // Using 0 as schema_id and "Log" as event_name for the single blob
-            vec![(0, "Log".to_string(), bytes, events_len)]
-        } else {
-            vec![]
+
+            // Each blob represents one event_name
+            blobs.push((0, event_name, bytes, events_len));
         }
+
+        blobs
     }
 
     /// Determine which fields are present in the LogRecord
@@ -401,7 +409,7 @@ mod tests {
     }
 
     #[test]
-    fn test_single_blob_output() {
+    fn test_group_by_event_name() {
         let encoder = OtlpEncoder::new();
 
         let mut log1 = LogRecord {
@@ -436,20 +444,49 @@ mod tests {
             }),
         });
 
+        // Add another login event with different schema
+        let mut log3 = LogRecord {
+            observed_time_unix_nano: 1_700_000_002_000_000_000,
+            event_name: "login".to_string(),
+            severity_number: 10,
+            ..Default::default()
+        };
+        log3.attributes.push(KeyValue {
+            key: "user".to_string(),
+            value: Some(AnyValue {
+                value: Some(Value::StringValue("charlie".to_string())),
+            }),
+        });
+        log3.attributes.push(KeyValue {
+            key: "ip_address".to_string(),
+            value: Some(AnyValue {
+                value: Some(Value::StringValue("192.168.1.1".to_string())),
+            }),
+        });
+
         let metadata = "namespace=test";
-        let logs = vec![log1, log2];
+        let logs = vec![log1, log2, log3];
         let result = encoder.encode_log_batch(logs.iter(), metadata);
 
-        // Should return exactly one blob
-        assert_eq!(result.len(), 1);
-        
-        // The single blob should contain all events
-        let (schema_id, event_name, _blob, event_count) = &result[0];
-        assert_eq!(*schema_id, 0);
-        assert_eq!(event_name, "Log");
-        assert_eq!(*event_count, 2);
+        // Should return two blobs: one for "login" and one for "logout"
+        assert_eq!(result.len(), 2);
 
-        // Verify we have 2 schemas cached (different attributes)
-        assert_eq!(encoder.schema_cache.read().unwrap().len(), 2);
+        // Find the login and logout blobs
+        let login_blob = result
+            .iter()
+            .find(|(_, name, _, _)| name == "login")
+            .unwrap();
+        let logout_blob = result
+            .iter()
+            .find(|(_, name, _, _)| name == "logout")
+            .unwrap();
+
+        // Login blob should have 2 events (log1 and log3)
+        assert_eq!(login_blob.3, 2);
+        // Logout blob should have 1 event (log2)
+        assert_eq!(logout_blob.3, 1);
+
+        // Verify we have 3 schemas cached (different attributes combinations)
+        assert_eq!(encoder.schema_cache.read().unwrap().len(), 3);
     }
 }
