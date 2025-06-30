@@ -4,7 +4,7 @@ use chrono::{TimeZone, Utc};
 use opentelemetry_proto::tonic::common::v1::any_value::Value;
 use opentelemetry_proto::tonic::logs::v1::LogRecord;
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 type SchemaCache = Arc<RwLock<HashMap<u64, (BondEncodedSchema, [u8; 16], Vec<FieldDef>)>>>;
@@ -20,6 +20,21 @@ const FIELD_NAME: &str = "name";
 const FIELD_SEVERITY_NUMBER: &str = "SeverityNumber";
 const FIELD_SEVERITY_TEXT: &str = "SeverityText";
 const FIELD_BODY: &str = "body";
+
+/// Event group for flattened structure - contains events for a single event_name
+struct EventGroup {
+    schema_ids: HashSet<u64>,
+    events: Vec<CentralEventEntry>,
+}
+
+impl EventGroup {
+    fn new() -> Self {
+        Self {
+            schema_ids: HashSet::new(),
+            events: Vec::new(),
+        }
+    }
+}
 
 /// Encoder to write OTLP payload in bond form.
 #[derive(Clone)]
@@ -45,11 +60,9 @@ impl OtlpEncoder {
     {
         use std::collections::HashMap;
 
-        // Group by event_name
-        let mut event_groups: HashMap<
-            String,
-            (HashMap<u64, CentralSchemaEntry>, Vec<CentralEventEntry>),
-        > = HashMap::new();
+        // Flattened structure: global schema storage + simple event groups
+        let mut global_schemas: HashMap<u64, CentralSchemaEntry> = HashMap::new();
+        let mut event_groups: HashMap<String, EventGroup> = HashMap::new();
 
         for log_record in logs {
             // 1. Get schema
@@ -66,16 +79,19 @@ impl OtlpEncoder {
             };
             let level = log_record.severity_number as u8;
 
-            // 3. Group by event_name
+            // 3. Store schema globally (deduplicated)
+            global_schemas.entry(schema_id).or_insert(schema_entry);
+
+            // 4. Group by event_name
             let group = event_groups
                 .entry(event_name.clone())
-                .or_insert_with(|| (HashMap::new(), Vec::new()));
+                .or_insert_with(EventGroup::new);
 
-            // Add schema if not already present for this event_name
-            group.0.entry(schema_id).or_insert(schema_entry);
+            // Track schema usage in this group
+            group.schema_ids.insert(schema_id);
 
             // Add event
-            group.1.push(CentralEventEntry {
+            group.events.push(CentralEventEntry {
                 schema_id,
                 level,
                 event_name,
@@ -83,18 +99,24 @@ impl OtlpEncoder {
             });
         }
 
-        // 4. Create one blob per event_name
+        // 5. Create one blob per event_name
         let mut blobs = Vec::new();
-        for (event_name, (schemas, events)) in event_groups {
-            let schemas_list: Vec<CentralSchemaEntry> = schemas.into_values().collect();
-            let events_len = events.len();
+        for (event_name, group) in event_groups {
+            // Collect schemas used by this event group (clone only when needed)
+            let schemas_list: Vec<CentralSchemaEntry> = group
+                .schema_ids
+                .iter()
+                .filter_map(|&id| global_schemas.get(&id))
+                .cloned()  // Clone only when building the final blob
+                .collect();
+            let events_len = group.events.len();
 
             let blob = CentralBlob {
                 version: 1,
                 format: 2,
                 metadata: metadata.to_string(),
                 schemas: schemas_list,
-                events,
+                events: group.events,
             };
             let bytes = blob.to_bytes();
 
