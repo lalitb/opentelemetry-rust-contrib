@@ -14,6 +14,78 @@ use thiserror::Error;
 use url::form_urlencoded::byte_serialize;
 use uuid::Uuid;
 
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+// Metrics for tracking upload performance
+#[derive(Debug, Default)]
+pub struct UploadMetrics {
+    /// Total number of requests processed
+    request_count: AtomicUsize,
+    /// Total response time in microseconds
+    total_response_time_micros: AtomicU64,
+    /// Total data size processed in bytes
+    total_data_size: AtomicU64,
+    /// Ongoing requests
+    ongoing_requests: AtomicUsize,
+}
+
+impl UploadMetrics {
+    /// Create new metrics instance
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a request with its response time and data size
+    fn record_request(&self, response_time_micros: u64, data_size: u64) {
+        self.request_count.fetch_add(1, Ordering::Relaxed);
+        self.total_response_time_micros
+            .fetch_add(response_time_micros, Ordering::Relaxed);
+        self.total_data_size.fetch_add(data_size, Ordering::Relaxed);
+    }
+
+    /// Get the average response time in microseconds
+    pub fn average_response_time_micros(&self) -> f64 {
+        let count = self.request_count.load(Ordering::Relaxed);
+        if count == 0 {
+            0.0
+        } else {
+            self.total_response_time_micros.load(Ordering::Relaxed) as f64 / count as f64
+        }
+    }
+
+    /// Get the average response time in milliseconds
+    pub fn average_response_time_millis(&self) -> f64 {
+        self.average_response_time_micros() / 1000.0
+    }
+
+    /// Get the total number of requests processed
+    pub fn request_count(&self) -> usize {
+        self.request_count.load(Ordering::Relaxed)
+    }
+
+    /// Get the average data size in bytes
+    pub fn average_data_size(&self) -> f64 {
+        let count = self.request_count.load(Ordering::Relaxed);
+        if count == 0 {
+            0.0
+        } else {
+            self.total_data_size.load(Ordering::Relaxed) as f64 / count as f64
+        }
+    }
+
+    /// Get the total data size processed in bytes
+    pub fn total_data_size(&self) -> u64 {
+        self.total_data_size.load(Ordering::Relaxed)
+    }
+
+    /// Reset all metrics
+    pub fn reset(&self) {
+        self.request_count.store(0, Ordering::Relaxed);
+        self.total_response_time_micros.store(0, Ordering::Relaxed);
+        self.total_data_size.store(0, Ordering::Relaxed);
+    }
+}
+
 /// Error types for the Geneva Uploader
 #[derive(Debug, Error)]
 pub(crate) enum GenevaUploaderError {
@@ -115,6 +187,7 @@ pub struct GenevaUploader {
     pub config_client: Arc<GenevaConfigClient>,
     pub config: GenevaUploaderConfig,
     pub http_client: Client,
+    pub metrics: Arc<UploadMetrics>,
 }
 
 impl GenevaUploader {
@@ -137,7 +210,7 @@ impl GenevaUploader {
             header::HeaderValue::from_static("application/json"),
         );
         let http_client = Client::builder()
-            .timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(100))
             .default_headers(headers)
             .build()?;
 
@@ -145,7 +218,16 @@ impl GenevaUploader {
             config_client,
             config: uploader_config,
             http_client,
+            metrics: Arc::new(UploadMetrics::new()),
         })
+    }
+
+    pub(crate) fn metrics(&self) -> &Arc<UploadMetrics> {
+        &self.metrics
+    }
+
+    pub(crate) fn ongoing_requests(&self) -> usize {
+        self.metrics.ongoing_requests.load(Ordering::Relaxed)
     }
 
     /// Creates the GIG upload URI with required parameters
@@ -246,6 +328,12 @@ impl GenevaUploader {
             upload_uri
         );
         // Send the upload request
+        use std::time::Instant;
+        //println!("Uploading data to: {}", full_url);
+        let start = Instant::now();
+        self.metrics
+            .ongoing_requests
+            .fetch_add(1, Ordering::Relaxed); // Increment ongoing requests
         let response = self
             .http_client
             .post(&full_url)
@@ -256,6 +344,15 @@ impl GenevaUploader {
             .body(data)
             .send()
             .await?;
+        self.metrics
+            .ongoing_requests
+            .fetch_sub(1, Ordering::Relaxed); // Decrement ongoing requests
+        let elapsed = start.elapsed();
+        self.metrics
+            .record_request(elapsed.as_micros() as u64, data_size as u64); // ADD THIS LINE
+
+        //println!("Request completed in: {:.2}μs data_size: {}", elapsed.as_micros(), data_size);
+
         let status = response.status();
         let body = response.text().await?;
 

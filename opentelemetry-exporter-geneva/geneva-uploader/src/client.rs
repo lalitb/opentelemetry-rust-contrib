@@ -103,4 +103,18 @@ impl GenevaClient {
         }
         Ok(())
     }
+
+    pub fn dump_upload_metrics(&self) {
+        let metrics = self.uploader.metrics();
+        println!(
+            "Upload Metrics: Requests Count: {}, Average data size: {} bytes, Average response time: {}μs",
+            metrics.request_count(),
+            metrics.average_data_size(),
+            metrics.average_response_time_micros(),
+        );
+    }
+
+    pub fn ongoing_requests(&self) -> usize {
+        self.uploader.ongoing_requests()
+    }
 }
