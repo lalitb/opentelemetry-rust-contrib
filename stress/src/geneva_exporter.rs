@@ -269,7 +269,9 @@ async fn async_main(
 
     // Warm up the ingestion token cache
     println!("Warming up token cache...");
-    client.upload_logs(&logs).await?;
+    let mut batches = Vec::new();
+    client.encode_and_compress_logs(&logs, &mut batches)?;
+    client.upload_compressed_blobs(batches).await?;
 
     println!("\nStarting Geneva exporter stress test using stream-based approach");
     println!("Press Ctrl+C to stop continuous tests\n");
@@ -287,7 +289,11 @@ async fn async_main(
             ThroughputTest::run_continuous("Geneva Upload", config, move || {
                 let client = client.clone();
                 let logs = logs.clone();
-                async move { client.upload_logs(&logs).await }
+                async move {
+                    let mut batches = Vec::new();
+                    client.encode_and_compress_logs(&logs, &mut batches)?;
+                    client.upload_compressed_blobs(batches).await
+                }
             })
             .await;
         }
@@ -308,7 +314,11 @@ async fn async_main(
             let stats = ThroughputTest::run_fixed("Geneva Upload", config, move || {
                 let client = client.clone();
                 let logs = logs.clone();
-                async move { client.upload_logs(&logs).await }
+                async move {
+                    let mut batches = Vec::new();
+                    client.encode_and_compress_logs(&logs, &mut batches)?;
+                    client.upload_compressed_blobs(batches).await
+                }
             })
             .await;
 
@@ -327,8 +337,12 @@ async fn async_main(
                     let client = client.clone();
                     let logs = logs.clone();
                     async move {
+                        let mut batches = Vec::new();
                         client
-                            .upload_logs(&logs)
+                            .encode_and_compress_logs(&logs, &mut batches)
+                            .map_err(std::io::Error::other)?;
+                        client
+                            .upload_compressed_blobs(batches)
                             .await
                             .map_err(std::io::Error::other)
                     }

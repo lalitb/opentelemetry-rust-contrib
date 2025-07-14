@@ -5,7 +5,15 @@ use crate::ingestion_service::uploader::{GenevaUploader, GenevaUploaderConfig};
 use crate::payload_encoder::lz4_chunked_compression::lz4_chunked_compression;
 use crate::payload_encoder::otlp_encoder::OtlpEncoder;
 use opentelemetry_proto::tonic::logs::v1::ResourceLogs;
+
+use futures::stream::{self, StreamExt, TryStreamExt};
 use std::sync::Arc;
+
+pub struct CompressedLogBatch {
+    pub event_name: String,
+    pub compressed_blob: Vec<u8>,
+    pub row_count: usize,
+}
 
 /// Configuration for GenevaClient (user-facing)
 #[derive(Clone, Debug)]
@@ -83,24 +91,53 @@ impl GenevaClient {
         })
     }
 
-    /// Upload OTLP logs (as ResourceLogs).
-    pub async fn upload_logs(&self, logs: &[ResourceLogs]) -> Result<(), String> {
+    pub fn encode_and_compress_logs<C>(
+        &self,
+        logs: &[ResourceLogs],
+        out: &mut C,
+    ) -> Result<(), String>
+    where
+        C: Extend<CompressedLogBatch>,
+    {
         let log_iter = logs
             .iter()
             .flat_map(|resource_log| resource_log.scope_logs.iter())
             .flat_map(|scope_log| scope_log.log_records.iter());
-        let blobs = self.encoder.encode_log_batch(log_iter, &self.metadata);
-        for (_schema_id, event_name, encoded_blob, _row_count) in blobs {
-            // TODO - log encoded_blob for debugging
-            let compressed_blob = lz4_chunked_compression(&encoded_blob)
-                .map_err(|e| format!("LZ4 compression failed: {e}"))?;
-            // TODO - log compressed_blob for debugging
-            let event_version = "Ver2v0"; // TODO - find the actual value to be populated
-            self.uploader
-                .upload(compressed_blob, &event_name, event_version)
-                .await
-                .map_err(|e| format!("Geneva upload failed: {e}"))?;
-        }
+        let batches = self.encoder.encode_log_batch(log_iter, &self.metadata);
+        let compressed_batches = batches
+            .into_iter()
+            .map(|(_schema_id, event_name, encoded_blob, row_count)| {
+                let compressed_blob = lz4_chunked_compression(&encoded_blob)
+                    .map_err(|e| format!("LZ4 compression failed: {e}"))?;
+                Ok(CompressedLogBatch {
+                    event_name,
+                    compressed_blob,
+                    row_count,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        out.extend(compressed_batches);
+        Ok(())
+    }
+
+    pub async fn upload_compressed_blobs(
+        &self,
+        batches: Vec<CompressedLogBatch>,
+    ) -> Result<(), String> {
+        let max_concurrency = 10;
+        stream::iter(batches)
+            .map(|batch| {
+                let uploader = self.uploader.clone();
+                async move {
+                    uploader
+                        .upload(batch.compressed_blob, &batch.event_name, "Ver2v0")
+                        .await
+                        .map_err(|e| format!("Geneva upload failed: {e}"))
+                }
+            })
+            .buffer_unordered(max_concurrency)
+            .try_collect::<Vec<_>>() // Will return early on first error
+            .await?;
         Ok(())
     }
 }
