@@ -5,8 +5,10 @@ use opentelemetry_proto::tonic::common::v1::any_value::Value;
 use opentelemetry_proto::tonic::logs::v1::LogRecord;
 use std::borrow::Cow;
 use std::collections::HashMap;
+#[cfg(feature = "schema_cache")]
 use std::sync::{Arc, RwLock};
 
+#[cfg(feature = "schema_cache")]
 type SchemaCache = Arc<RwLock<HashMap<u64, (BondEncodedSchema, [u8; 16], Vec<FieldDef>)>>>;
 type BatchKey = (u64, String);
 type EncodedRow = (String, u8, Vec<u8>); // (event_name, level, row_buffer)
@@ -28,13 +30,14 @@ const FIELD_BODY: &str = "body";
 /// Encoder to write OTLP payload in bond form.
 #[derive(Clone)]
 pub struct OtlpEncoder {
-    // TODO - limit cache size or use LRU eviction, and/or add feature flag for caching
+    #[cfg(feature = "schema_cache")]
     schema_cache: SchemaCache,
 }
 
 impl OtlpEncoder {
     pub fn new() -> Self {
         OtlpEncoder {
+            #[cfg(feature = "schema_cache")]
             schema_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -151,7 +154,6 @@ impl OtlpEncoder {
                 fields.push((attr.key.clone().into(), type_id));
             }
         }
-        fields.sort_by(|a, b| a.0.cmp(&b.0)); // Sort fields by name consistent schema ID generation
         fields
             .into_iter()
             .enumerate()
@@ -184,18 +186,21 @@ impl OtlpEncoder {
         schema_id: u64,
         field_info: Vec<FieldDef>,
     ) -> (CentralSchemaEntry, Vec<FieldDef>) {
-        // Check cache first
-        if let Some((schema, schema_md5, field_info)) =
-            self.schema_cache.read().unwrap().get(&schema_id)
+        #[cfg(feature = "schema_cache")]
         {
-            return (
-                CentralSchemaEntry {
-                    id: schema_id,
-                    md5: *schema_md5,
-                    schema: schema.clone(),
-                },
-                field_info.clone(),
-            );
+            // Check cache first
+            if let Some((schema, schema_md5, field_info)) =
+                self.schema_cache.read().unwrap().get(&schema_id)
+            {
+                return (
+                    CentralSchemaEntry {
+                        id: schema_id,
+                        md5: *schema_md5,
+                        schema: schema.clone(),
+                    },
+                    field_info.clone(),
+                );
+            }
         }
 
         let schema =
@@ -203,8 +208,10 @@ impl OtlpEncoder {
 
         let schema_bytes = schema.as_bytes();
         let schema_md5 = md5::compute(schema_bytes).0;
-        // Cache the schema and field info
+
+        #[cfg(feature = "schema_cache")]
         {
+            // Cache the schema and field info
             let mut cache = self.schema_cache.write().unwrap();
             // TODO: Refactor to eliminate field_info duplication in cache
             // The field information (name, type_id, order) is already stored in BondEncodedSchema's
@@ -215,9 +222,6 @@ impl OtlpEncoder {
             // This would require updating write_row_data() to work with DynamicSchema fields directly
             cache.insert(schema_id, (schema.clone(), schema_md5, field_info.clone()));
         }
-
-        let schema_bytes = schema.as_bytes();
-        let schema_md5 = md5::compute(schema_bytes).0;
 
         (
             CentralSchemaEntry {
@@ -230,10 +234,10 @@ impl OtlpEncoder {
     }
 
     /// Write row data directly from LogRecord
-    fn write_row_data(&self, log: &LogRecord, sorted_fields: &[FieldDef]) -> Vec<u8> {
-        let mut buffer = Vec::with_capacity(sorted_fields.len() * 50); //TODO - estimate better
+    fn write_row_data(&self, log: &LogRecord, fields: &[FieldDef]) -> Vec<u8> {
+        let mut buffer = Vec::with_capacity(fields.len() * 50); //TODO - estimate better
 
-        for field in sorted_fields {
+        for field in fields {
             match field.name.as_ref() {
                 FIELD_ENV_NAME => BondWriter::write_string(&mut buffer, "TestEnv"), // TODO - placeholder for actual env name
                 FIELD_ENV_VER => BondWriter::write_string(&mut buffer, "4.0"), // TODO - placeholder for actual env version
@@ -367,6 +371,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "schema_cache")]
     fn test_schema_caching() {
         let encoder = OtlpEncoder::new();
 
@@ -396,5 +401,34 @@ mod tests {
         log2.trace_id = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
         let _result3 = encoder.encode_log_batch([log2].iter(), metadata);
         assert_eq!(encoder.schema_cache.read().unwrap().len(), 2);
+    }
+
+    #[test]
+    #[cfg(not(feature = "schema_cache"))]
+    fn test_no_schema_caching() {
+        let encoder = OtlpEncoder::new();
+
+        let log1 = LogRecord {
+            observed_time_unix_nano: 1_700_000_000_000_000_000,
+            severity_number: 9,
+            ..Default::default()
+        };
+
+        let log2 = LogRecord {
+            observed_time_unix_nano: 1_700_000_001_000_000_000,
+            severity_number: 10,
+            ..Default::default()
+        };
+
+        let metadata = "namespace=test";
+
+        // Both encodings should work without caching
+        let result1 = encoder.encode_log_batch([log1].iter(), metadata);
+        let result2 = encoder.encode_log_batch([log2].iter(), metadata);
+
+        assert!(!result1.is_empty());
+        assert!(!result2.is_empty());
+        // Both should have the same schema ID since they have the same fields
+        assert_eq!(result1[0].0, result2[0].0); // schema_id should be the same
     }
 }
