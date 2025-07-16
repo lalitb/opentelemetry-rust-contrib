@@ -52,7 +52,7 @@ fn create_test_logs() -> Vec<ResourceLogs> {
     let mut log_records = Vec::new();
 
     // Create 10 simple log records
-    for i in 0..10 {
+    for i in 0..200000 {
         let log = LogRecord {
             observed_time_unix_nano: 1700000000000000000 + i,
             event_name: "StressTestEvent".to_string(),
@@ -276,12 +276,22 @@ async fn async_main(
 
     match mode {
         "continuous" => {
+            let client_for_callback = Arc::clone(&client);
+            let client_for_ongoing = Arc::clone(&client);
+
             // Run continuous test
             let config = ThroughputConfig {
                 concurrency,
                 report_interval: std::time::Duration::from_secs(5),
                 target_ops: None,
                 use_spawn: runtime_type != "current", // Use task spawning for multi-thread runtime
+                shutdown_callback: Some(Box::new(move || {
+                    client_for_callback.dump_upload_metrics(); // Print upload metrics on shutdown
+                    println!("\nContinuous test stopped. Metrics printed.");
+                })),
+                ongoing_requests_callback: Some(Box::new(move || {
+                    client_for_ongoing.ongoing_requests()
+                })),
             };
 
             ThroughputTest::run_continuous("Geneva Upload", config, move || {
@@ -294,7 +304,7 @@ async fn async_main(
         "fixed" => {
             // Run fixed test
             let target = args
-                .get(3)
+                .get(args_start_idx + 2)
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(10_000);
 
@@ -304,6 +314,7 @@ async fn async_main(
                 use_spawn: runtime_type != "current", // Use task spawning for multi-thread runtime
                 ..Default::default()
             };
+            let client_for_metrics = Arc::clone(&client);
 
             let stats = ThroughputTest::run_fixed("Geneva Upload", config, move || {
                 let client = client.clone();
@@ -313,6 +324,8 @@ async fn async_main(
             .await;
 
             stats.print("Final Results");
+            client_for_metrics.dump_upload_metrics(); // Print upload metrics
+            println!("\nTest completed successfully.");
         }
         _ => {
             // Default: Run comparison test
