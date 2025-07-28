@@ -76,8 +76,8 @@ impl OtlpEncoder {
                         if i > 0 {
                             acc.push(';');
                         }
-                        let md5_hash = md5::compute(s.id.to_le_bytes());
-                        write!(&mut acc, "{md5_hash:x}").unwrap();
+                        // Use the cached MD5 hash instead of recalculating
+                        write!(&mut acc, "{:x}", md5::Digest(s.md5)).unwrap();
                         acc
                     },
                 )
