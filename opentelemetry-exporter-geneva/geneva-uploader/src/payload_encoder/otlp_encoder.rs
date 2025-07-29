@@ -107,10 +107,7 @@ impl OtlpEncoder {
             let (field_info, base_schema_id) =
                 Self::determine_fields_and_schema_id(log_record, event_name_str);
 
-            // Include namespace in schema ID to differentiate schemas with same structure but different namespaces
-            let schema_id = Self::calculate_final_schema_id(base_schema_id, &self.namespace);
-
-            let schema_entry = self.get_or_create_schema(schema_id, field_info.as_slice());
+            let schema_entry = self.get_or_create_schema(base_schema_id, field_info.as_slice());
             // 2. Encode row
             let row_buffer = self.write_row_data(log_record, &field_info);
             let level = log_record.severity_number as u8;
@@ -135,13 +132,13 @@ impl OtlpEncoder {
             }
 
             // 4. Add schema entry if not already present (multiple schemas per event_name batch)
-            if !entry.schemas.iter().any(|s| s.id == schema_id) {
+            if !entry.schemas.iter().any(|s| s.id == base_schema_id) {
                 entry.schemas.push(schema_entry);
             }
 
             // 5. Create CentralEventEntry directly (optimization: no intermediate EncodedRow)
             let central_event = CentralEventEntry {
-                schema_id,
+                schema_id: base_schema_id,
                 level,
                 event_name: Arc::new(event_name_str.to_string()),
                 row: row_buffer,
@@ -292,17 +289,6 @@ impl OtlpEncoder {
     }
 
 
-    /// Calculate final schema ID by combining base schema ID with namespace
-    /// This ensures different namespaces create different schema cache entries
-    fn calculate_final_schema_id(base_schema_id: u64, namespace: &str) -> u64 {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        
-        let mut hasher = DefaultHasher::new();
-        base_schema_id.hash(&mut hasher);
-        namespace.hash(&mut hasher);
-        hasher.finish()
-    }
 
     /// Write row data directly from LogRecord
     fn write_row_data(&self, log: &LogRecord, sorted_fields: &[FieldDef]) -> Vec<u8> {
