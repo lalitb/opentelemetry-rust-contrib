@@ -90,7 +90,7 @@ impl OtlpEncoder {
             // 1. Get schema with optimized single-pass field collection and schema ID calculation
             let (field_info, schema_id) =
                 Self::determine_fields_and_schema_id(log_record, event_name_str);
-            let schema_entry = self.create_schema(schema_id, field_info.as_slice(), namespace);
+            let schema_entry = Self::create_schema(schema_id, field_info.as_slice(), namespace);
             // 2. Encode row
             let row_buffer = self.write_row_data(log_record, &field_info);
             let level = log_record.severity_number as u8;
@@ -679,8 +679,11 @@ mod tests {
         assert!(!result1.is_empty());
         assert!(!result2.is_empty());
         
-        // Each encoder should have its own schema cache
-        assert_eq!(encoder1.schema_cache.read().unwrap().len(), 1);
-        assert_eq!(encoder2.schema_cache.read().unwrap().len(), 1);
+        // Verify that both namespaces produce results
+        // Since schema_cache was removed, we just verify the functionality works
+        assert_eq!(result1.len(), 1);
+        assert_eq!(result2.len(), 1);
+        assert_eq!(result1[0].event_name, "test_event");
+        assert_eq!(result2[0].event_name, "test_event");
     }
 }
