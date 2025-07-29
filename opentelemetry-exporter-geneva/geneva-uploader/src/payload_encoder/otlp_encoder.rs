@@ -104,10 +104,10 @@ impl OtlpEncoder {
             };
 
             // 1. Get schema with optimized single-pass field collection and schema ID calculation
-            let (field_info, base_schema_id) =
+            let (field_info, schema_id) =
                 Self::determine_fields_and_schema_id(log_record, event_name_str);
 
-            let schema_entry = self.get_or_create_schema(base_schema_id, field_info.as_slice());
+            let schema_entry = self.get_or_create_schema(schema_id, field_info.as_slice());
             // 2. Encode row
             let row_buffer = self.write_row_data(log_record, &field_info);
             let level = log_record.severity_number as u8;
@@ -132,13 +132,13 @@ impl OtlpEncoder {
             }
 
             // 4. Add schema entry if not already present (multiple schemas per event_name batch)
-            if !entry.schemas.iter().any(|s| s.id == base_schema_id) {
+            if !entry.schemas.iter().any(|s| s.id == schema_id) {
                 entry.schemas.push(schema_entry);
             }
 
             // 5. Create CentralEventEntry directly (optimization: no intermediate EncodedRow)
             let central_event = CentralEventEntry {
-                schema_id: base_schema_id,
+                schema_id,
                 level,
                 event_name: Arc::new(event_name_str.to_string()),
                 row: row_buffer,
