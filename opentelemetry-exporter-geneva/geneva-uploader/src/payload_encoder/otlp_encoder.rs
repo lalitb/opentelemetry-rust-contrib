@@ -28,14 +28,12 @@ const FIELD_BODY: &str = "body";
 pub(crate) struct OtlpEncoder {
     // TODO - limit cache size or use LRU eviction, and/or add feature flag for caching
     schema_cache: SchemaCache,
-    namespace: String,
 }
 
 impl OtlpEncoder {
-    pub(crate) fn new(namespace: String) -> Self {
+    pub(crate) fn new() -> Self {
         OtlpEncoder {
             schema_cache: Arc::new(RwLock::new(HashMap::new())),
-            namespace,
         }
     }
 
@@ -46,7 +44,7 @@ impl OtlpEncoder {
     }
 
     /// Encode a batch of logs into a vector of (event_name, bytes, schema_ids, start_time_nanos, end_time_nanos)
-    pub(crate) fn encode_log_batch<'a, I>(&self, logs: I, metadata: &str) -> Vec<EncodedBatch>
+    pub(crate) fn encode_log_batch<'a, I>(&self, logs: I, namespace: &str, metadata: &str) -> Vec<EncodedBatch>
     where
         I: IntoIterator<Item = &'a opentelemetry_proto::tonic::logs::v1::LogRecord>,
     {
@@ -107,7 +105,7 @@ impl OtlpEncoder {
             let (field_info, schema_id) =
                 Self::determine_fields_and_schema_id(log_record, event_name_str);
 
-            let schema_entry = self.get_or_create_schema(schema_id, field_info.as_slice());
+            let schema_entry = self.get_or_create_schema(schema_id, field_info.as_slice(), namespace);
             // 2. Encode row
             let row_buffer = self.write_row_data(log_record, &field_info);
             let level = log_record.severity_number as u8;
@@ -254,7 +252,7 @@ impl OtlpEncoder {
     }
 
     /// Get or create schema - fields are accessible via returned schema entry
-    fn get_or_create_schema(&self, schema_id: u64, field_info: &[FieldDef]) -> CentralSchemaEntry {
+    fn get_or_create_schema(&self, schema_id: u64, field_info: &[FieldDef], namespace: &str) -> CentralSchemaEntry {
         {
             if let Some((schema_arc, schema_md5)) =
                 self.schema_cache.read().unwrap().get(&schema_id)
@@ -267,9 +265,9 @@ impl OtlpEncoder {
             }
         }
 
-        // Use namespace from the struct
+        // Use namespace from the parameter
         let schema =
-            BondEncodedSchema::from_fields("MdsContainer", &self.namespace, field_info.to_vec());
+            BondEncodedSchema::from_fields("MdsContainer", namespace, field_info.to_vec());
 
         let schema_bytes = schema.as_bytes();
         let schema_md5 = md5::compute(schema_bytes).0;
@@ -402,7 +400,7 @@ mod tests {
 
     #[test]
     fn test_encoding() {
-        let encoder = OtlpEncoder::new("testNamespace".to_string());
+        let encoder = OtlpEncoder::new();
 
         let mut log = LogRecord {
             observed_time_unix_nano: 1_700_000_000_000_000_000,
@@ -428,14 +426,14 @@ mod tests {
         });
 
         let metadata = "namespace=testNamespace/eventVersion=Ver1v0";
-        let result = encoder.encode_log_batch([log].iter(), metadata);
+        let result = encoder.encode_log_batch([log].iter(), "testNamespace", metadata);
 
         assert!(!result.is_empty());
     }
 
     #[test]
     fn test_schema_caching() {
-        let encoder = OtlpEncoder::new("test".to_string());
+        let encoder = OtlpEncoder::new();
 
         let log1 = LogRecord {
             observed_time_unix_nano: 1_700_000_000_000_000_000,
@@ -452,22 +450,22 @@ mod tests {
         let metadata = "namespace=test";
 
         // First encoding creates schema
-        let _result1 = encoder.encode_log_batch([log1].iter(), metadata);
+        let _result1 = encoder.encode_log_batch([log1].iter(), "test", metadata);
         assert_eq!(encoder.schema_cache.read().unwrap().len(), 1);
 
         // Second encoding with same schema structure reuses schema
-        let _result2 = encoder.encode_log_batch([log2.clone()].iter(), metadata);
+        let _result2 = encoder.encode_log_batch([log2.clone()].iter(), "test", metadata);
         assert_eq!(encoder.schema_cache.read().unwrap().len(), 1);
 
         // Add trace_id to create different schema
         log2.trace_id = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
-        let _result3 = encoder.encode_log_batch([log2].iter(), metadata);
+        let _result3 = encoder.encode_log_batch([log2].iter(), "test", metadata);
         assert_eq!(encoder.schema_cache.read().unwrap().len(), 2);
     }
 
     #[test]
     fn test_single_event_single_schema() {
-        let encoder = OtlpEncoder::new("test".to_string());
+        let encoder = OtlpEncoder::new();
 
         let log = LogRecord {
             observed_time_unix_nano: 1_700_000_000_000_000_000,
@@ -476,7 +474,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = encoder.encode_log_batch([log].iter(), "test");
+        let result = encoder.encode_log_batch([log].iter(), "test", "test");
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].event_name, "test_event");
@@ -486,7 +484,7 @@ mod tests {
 
     #[test]
     fn test_same_event_name_multiple_schemas() {
-        let encoder = OtlpEncoder::new("test".to_string());
+        let encoder = OtlpEncoder::new();
 
         // Schema 1: Basic log
         let log1 = LogRecord {
@@ -516,7 +514,7 @@ mod tests {
             }),
         });
 
-        let result = encoder.encode_log_batch([log1, log2, log3].iter(), "test");
+        let result = encoder.encode_log_batch([log1, log2, log3].iter(), "test", "test");
 
         // All should be in one batch with same event_name
         assert_eq!(result.len(), 1);
