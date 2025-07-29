@@ -529,7 +529,7 @@ mod tests {
 
     #[test]
     fn test_different_event_names() {
-        let encoder = OtlpEncoder::new("test".to_string());
+        let encoder = OtlpEncoder::new();
 
         let log1 = LogRecord {
             event_name: "login".to_string(),
@@ -543,7 +543,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = encoder.encode_log_batch([log1, log2].iter(), "test");
+        let result = encoder.encode_log_batch([log1, log2].iter(), "test", "test");
 
         // Should create 2 separate batches
         assert_eq!(result.len(), 2);
@@ -558,7 +558,7 @@ mod tests {
 
     #[test]
     fn test_empty_event_name_defaults_to_log() {
-        let encoder = OtlpEncoder::new("test".to_string());
+        let encoder = OtlpEncoder::new();
 
         let log = LogRecord {
             event_name: "".to_string(),
@@ -566,7 +566,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = encoder.encode_log_batch([log].iter(), "test");
+        let result = encoder.encode_log_batch([log].iter(), "test", "test");
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].event_name, "Log"); // Should default to "Log"
@@ -575,7 +575,7 @@ mod tests {
 
     #[test]
     fn test_mixed_scenario() {
-        let encoder = OtlpEncoder::new("test".to_string());
+        let encoder = OtlpEncoder::new();
 
         // event_name1 with schema1
         let log1 = LogRecord {
@@ -612,7 +612,7 @@ mod tests {
             }),
         });
 
-        let result = encoder.encode_log_batch([log1, log2, log3, log4].iter(), "test");
+        let result = encoder.encode_log_batch([log1, log2, log3, log4].iter(), "test", "test");
 
         // Should create 3 batches: "user_action", "system_alert", "Log"
         assert_eq!(result.len(), 3);
@@ -653,13 +653,13 @@ mod tests {
             ..Default::default()
         };
 
-        // Test with different namespaces
-        let encoder1 = OtlpEncoder::new("customNamespace".to_string());
-        let encoder2 = OtlpEncoder::new("anotherNamespace".to_string());
+        // Test with different namespaces using separate encoder instances
+        let encoder1 = OtlpEncoder::new();
+        let encoder2 = OtlpEncoder::new();
         
         let metadata = "eventVersion=Ver1v0";
-        let result1 = encoder1.encode_log_batch([log.clone()].iter(), metadata);
-        let result2 = encoder2.encode_log_batch([log].iter(), metadata);
+        let result1 = encoder1.encode_log_batch([log.clone()].iter(), "customNamespace", metadata);
+        let result2 = encoder2.encode_log_batch([log].iter(), "anotherNamespace", metadata);
 
         assert!(!result1.is_empty());
         assert!(!result2.is_empty());
