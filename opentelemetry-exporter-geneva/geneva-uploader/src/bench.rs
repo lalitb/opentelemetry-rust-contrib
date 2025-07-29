@@ -178,8 +178,11 @@ mod benchmarks {
                         .collect();
 
                     b.iter(|| {
-                        let res =
-                            encoder.encode_log_batch(black_box(logs.iter()), black_box(metadata));
+                        let res = encoder.encode_log_batch(
+                            black_box(logs.iter()),
+                            black_box("benchmark"),
+                            black_box(metadata),
+                        );
                         black_box(res); // double sure the return value is generated
                     });
                 },
@@ -206,9 +209,11 @@ mod benchmarks {
                         .collect();
 
                     b.iter(|| {
-                        let res = black_box(
-                            encoder.encode_log_batch(black_box(logs.iter()), black_box(metadata)),
-                        );
+                        let res = black_box(encoder.encode_log_batch(
+                            black_box(logs.iter()),
+                            black_box("benchmark"),
+                            black_box(metadata),
+                        ));
                         black_box(res); // double sure the return value is generated
                     });
                 },
@@ -231,9 +236,11 @@ mod benchmarks {
                 .collect();
 
             b.iter(|| {
-                let res = black_box(
-                    encoder.encode_log_batch(black_box(logs.iter()), black_box(metadata)),
-                );
+                let res = black_box(encoder.encode_log_batch(
+                    black_box(logs.iter()),
+                    black_box("benchmark"),
+                    black_box(metadata),
+                ));
                 black_box(res);
             });
         });

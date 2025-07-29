@@ -32,6 +32,7 @@ pub struct GenevaClient {
     uploader: Arc<GenevaUploader>,
     encoder: OtlpEncoder,
     metadata: String,
+    namespace: String,
     max_concurrent_uploads: usize,
 }
 
@@ -89,6 +90,7 @@ impl GenevaClient {
             uploader: Arc::new(uploader),
             encoder: OtlpEncoder::new(),
             metadata,
+            namespace: cfg.namespace,
             max_concurrent_uploads,
         })
     }
@@ -101,7 +103,7 @@ impl GenevaClient {
             .flat_map(|scope_log| scope_log.log_records.iter());
         // TODO: Investigate using tokio::spawn_blocking for event encoding to avoid blocking
         // the async executor thread for CPU-intensive work.
-        let blobs = self.encoder.encode_log_batch(log_iter, &self.metadata);
+        let blobs = self.encoder.encode_log_batch(log_iter, &self.namespace, &self.metadata);
 
         // create an iterator that yields futures for each upload
         let upload_futures = blobs.into_iter().map(|batch| {
