@@ -151,7 +151,7 @@ mod benchmarks {
     // To run: $cargo test --release encode_log_batch_benchmark -- --nocapture --ignored
     fn encode_log_batch_benchmark() {
         let mut criterion = Criterion::default();
-        let encoder = OtlpEncoder::new();
+        let encoder = OtlpEncoder::new("benchmark".to_string());
         let metadata = "namespace=benchmark/eventVersion=Ver1v0";
 
         // Benchmark 1: Different numbers of attributes

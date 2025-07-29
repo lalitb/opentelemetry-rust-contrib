@@ -87,7 +87,7 @@ impl GenevaClient {
         });
         Ok(Self {
             uploader: Arc::new(uploader),
-            encoder: OtlpEncoder::new(),
+            encoder: OtlpEncoder::new(cfg.namespace),
             metadata,
             max_concurrent_uploads,
         })

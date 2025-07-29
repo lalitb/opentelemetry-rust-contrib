@@ -28,12 +28,14 @@ const FIELD_BODY: &str = "body";
 pub(crate) struct OtlpEncoder {
     // TODO - limit cache size or use LRU eviction, and/or add feature flag for caching
     schema_cache: SchemaCache,
+    namespace: String,
 }
 
 impl OtlpEncoder {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(namespace: String) -> Self {
         OtlpEncoder {
             schema_cache: Arc::new(RwLock::new(HashMap::new())),
+            namespace,
         }
     }
 
@@ -102,8 +104,11 @@ impl OtlpEncoder {
             };
 
             // 1. Get schema with optimized single-pass field collection and schema ID calculation
-            let (field_info, schema_id) =
+            let (field_info, base_schema_id) =
                 Self::determine_fields_and_schema_id(log_record, event_name_str);
+
+            // Include namespace in schema ID to differentiate schemas with same structure but different namespaces
+            let schema_id = Self::calculate_final_schema_id(base_schema_id, &self.namespace);
 
             let schema_entry = self.get_or_create_schema(schema_id, field_info.as_slice());
             // 2. Encode row
@@ -265,10 +270,9 @@ impl OtlpEncoder {
             }
         }
 
-        // Only clone field_info when we actually need to create a new schema
-        // Investigate if we can avoid cloning by using Cow using Arc to fields_info
+        // Use namespace from the struct
         let schema =
-            BondEncodedSchema::from_fields("OtlpLogRecord", "telemetry", field_info.to_vec()); //TODO - use actual struct name and namespace
+            BondEncodedSchema::from_fields("MdsContainer", &self.namespace, field_info.to_vec());
 
         let schema_bytes = schema.as_bytes();
         let schema_md5 = md5::compute(schema_bytes).0;
@@ -285,6 +289,19 @@ impl OtlpEncoder {
             md5: schema_md5,
             schema,
         }
+    }
+
+
+    /// Calculate final schema ID by combining base schema ID with namespace
+    /// This ensures different namespaces create different schema cache entries
+    fn calculate_final_schema_id(base_schema_id: u64, namespace: &str) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        
+        let mut hasher = DefaultHasher::new();
+        base_schema_id.hash(&mut hasher);
+        namespace.hash(&mut hasher);
+        hasher.finish()
     }
 
     /// Write row data directly from LogRecord
@@ -399,7 +416,7 @@ mod tests {
 
     #[test]
     fn test_encoding() {
-        let encoder = OtlpEncoder::new();
+        let encoder = OtlpEncoder::new("testNamespace".to_string());
 
         let mut log = LogRecord {
             observed_time_unix_nano: 1_700_000_000_000_000_000,
@@ -432,7 +449,7 @@ mod tests {
 
     #[test]
     fn test_schema_caching() {
-        let encoder = OtlpEncoder::new();
+        let encoder = OtlpEncoder::new("test".to_string());
 
         let log1 = LogRecord {
             observed_time_unix_nano: 1_700_000_000_000_000_000,
@@ -464,7 +481,7 @@ mod tests {
 
     #[test]
     fn test_single_event_single_schema() {
-        let encoder = OtlpEncoder::new();
+        let encoder = OtlpEncoder::new("test".to_string());
 
         let log = LogRecord {
             observed_time_unix_nano: 1_700_000_000_000_000_000,
@@ -483,7 +500,7 @@ mod tests {
 
     #[test]
     fn test_same_event_name_multiple_schemas() {
-        let encoder = OtlpEncoder::new();
+        let encoder = OtlpEncoder::new("test".to_string());
 
         // Schema 1: Basic log
         let log1 = LogRecord {
@@ -528,7 +545,7 @@ mod tests {
 
     #[test]
     fn test_different_event_names() {
-        let encoder = OtlpEncoder::new();
+        let encoder = OtlpEncoder::new("test".to_string());
 
         let log1 = LogRecord {
             event_name: "login".to_string(),
@@ -557,7 +574,7 @@ mod tests {
 
     #[test]
     fn test_empty_event_name_defaults_to_log() {
-        let encoder = OtlpEncoder::new();
+        let encoder = OtlpEncoder::new("test".to_string());
 
         let log = LogRecord {
             event_name: "".to_string(),
@@ -574,7 +591,7 @@ mod tests {
 
     #[test]
     fn test_mixed_scenario() {
-        let encoder = OtlpEncoder::new();
+        let encoder = OtlpEncoder::new("test".to_string());
 
         // event_name1 with schema1
         let log1 = LogRecord {
@@ -640,5 +657,31 @@ mod tests {
 
         // Should have 4 different schemas cached
         assert_eq!(encoder.schema_cache.read().unwrap().len(), 4);
+    }
+
+
+    #[test]
+    fn test_schema_uses_different_namespaces() {
+        let log = LogRecord {
+            observed_time_unix_nano: 1_700_000_000_000_000_000,
+            event_name: "test_event".to_string(),
+            severity_number: 9,
+            ..Default::default()
+        };
+
+        // Test with different namespaces
+        let encoder1 = OtlpEncoder::new("customNamespace".to_string());
+        let encoder2 = OtlpEncoder::new("anotherNamespace".to_string());
+        
+        let metadata = "eventVersion=Ver1v0";
+        let result1 = encoder1.encode_log_batch([log.clone()].iter(), metadata);
+        let result2 = encoder2.encode_log_batch([log].iter(), metadata);
+
+        assert!(!result1.is_empty());
+        assert!(!result2.is_empty());
+        
+        // Each encoder should have its own schema cache
+        assert_eq!(encoder1.schema_cache.read().unwrap().len(), 1);
+        assert_eq!(encoder2.schema_cache.read().unwrap().len(), 1);
     }
 }
