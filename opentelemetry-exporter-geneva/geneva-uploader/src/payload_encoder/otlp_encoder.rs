@@ -20,6 +20,8 @@ const FIELD_SEVERITY_NUMBER: &str = "SeverityNumber";
 const FIELD_SEVERITY_TEXT: &str = "SeverityText";
 const FIELD_BODY: &str = "body";
 
+const SCHEMA_TYPE_NAME: &str = "OtlpLogRecord";
+
 /// Encoder to write OTLP payload in bond form.
 #[derive(Clone)]
 pub(crate) struct OtlpEncoder;
@@ -239,7 +241,7 @@ impl OtlpEncoder {
     /// Create schema - always creates a new CentralSchemaEntry
     fn create_schema(schema_id: u64, field_info: &[FieldDef], namespace: &str) -> CentralSchemaEntry {
         let schema =
-            BondEncodedSchema::from_fields("MdsContainer", namespace, field_info.to_vec());
+            BondEncodedSchema::from_fields(SCHEMA_TYPE_NAME, namespace, field_info.to_vec());
 
         let schema_bytes = schema.as_bytes();
         let schema_md5 = md5::compute(schema_bytes).0;
