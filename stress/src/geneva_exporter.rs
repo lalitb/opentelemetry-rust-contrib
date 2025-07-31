@@ -1,6 +1,10 @@
 // Geneva exporter stress test using the generic stream throughput tester
 //
-// Run with: cargo run --bin geneva_stream_stress --release -- [multi|current] [concurrency] [fixed|continuous|comparison]
+// Run with: cargo run --bin geneva_exporter --release -- [multi|current] [concurrency] [fixed|continuous|comparison]
+//
+// For heap profiling using heaptrack (works with any allocator):
+// heaptrack --record-only cargo run --bin geneva_exporter --release -- multi 500 continuous
+// Then analyze with: heaptrack_print heaptrack.geneva_exporter.*.gz
 
 /*
    ## Hardware & OS:
@@ -38,6 +42,8 @@ use opentelemetry_proto::tonic::common::v1::any_value::Value;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::signal;
 
 // Import the generic stream throughput test module
 mod async_throughput;
@@ -46,6 +52,18 @@ use async_throughput::{ThroughputConfig, ThroughputTest};
 // Import mock server setup if needed
 use wiremock::matchers::{method, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+// RAII wrapper to ensure MockServer is properly dropped
+pub struct MockServerHandle {
+    _server: MockServer,
+    uri: String,
+}
+
+impl MockServerHandle {
+    pub fn uri(&self) -> &str {
+        &self.uri
+    }
+}
 
 // Helper functions
 fn create_test_logs() -> Vec<ResourceLogs> {
@@ -98,7 +116,7 @@ fn generate_mock_jwt_and_expiry(_endpoint: &str, _ttl_secs: i64) -> (String, Str
     (token.to_string(), expiry.to_string())
 }
 
-async fn init_client() -> Result<(GenevaClient, Option<String>), Box<dyn std::error::Error>> {
+async fn init_client() -> Result<(GenevaClient, Option<MockServerHandle>), Box<dyn std::error::Error>> {
     // Check if we should use real endpoints
     if let Ok(endpoint) = std::env::var("GENEVA_ENDPOINT") {
         println!("Using real Geneva endpoint: {endpoint}");
@@ -148,9 +166,10 @@ async fn init_client() -> Result<(GenevaClient, Option<String>), Box<dyn std::er
     } else {
         println!("Using wiremock Geneva endpoints");
 
-        // Setup mock server
+        // Setup mock server with RAII wrapper
         let mock_server = MockServer::start().await;
-        let ingestion_endpoint = format!("{}/ingestion", mock_server.uri());
+        let uri = mock_server.uri();
+        let ingestion_endpoint = format!("{}/ingestion", uri);
         let (auth_token, auth_token_expiry) =
             generate_mock_jwt_and_expiry(&ingestion_endpoint, 24 * 3600);
 
@@ -170,7 +189,7 @@ async fn init_client() -> Result<(GenevaClient, Option<String>), Box<dyn std::er
                     }}],
                     "TagId": "test"
                 }}"#,
-                mock_server.uri()
+                uri
             )))
             .mount(&mock_server)
             .await;
@@ -184,8 +203,14 @@ async fn init_client() -> Result<(GenevaClient, Option<String>), Box<dyn std::er
             .mount(&mock_server)
             .await;
 
+        // Create RAII handle to ensure mock server is properly dropped
+        let handle = MockServerHandle {
+            _server: mock_server,
+            uri: uri.clone(),
+        };
+
         let config = GenevaClientConfig {
-            endpoint: mock_server.uri(),
+            endpoint: uri,
             environment: "test".to_string(),
             account: "test".to_string(),
             namespace: "test".to_string(),
@@ -198,7 +223,7 @@ async fn init_client() -> Result<(GenevaClient, Option<String>), Box<dyn std::er
         };
 
         let client = GenevaClient::new(config).await?;
-        Ok((client, Some(mock_server.uri())))
+        Ok((client, Some(handle)))
     }
 }
 
@@ -263,9 +288,12 @@ async fn async_main(
         .unwrap_or("comparison");
 
     // Initialize client and test data
-    let (client, _mock_uri) = init_client().await?;
+    let (client, mock_handle) = init_client().await?;
     let client = Arc::new(client);
     let logs = Arc::new(create_test_logs());
+
+    // Keep mock handle alive for the entire duration of the test
+    let _keep_server_alive = mock_handle;
 
     // Warm up the ingestion token cache
     println!("Warming up token cache...");

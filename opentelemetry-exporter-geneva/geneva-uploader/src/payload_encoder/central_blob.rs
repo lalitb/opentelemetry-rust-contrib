@@ -78,6 +78,7 @@ fn utf8_to_utf16le_bytes(s: &str) -> Vec<u8> {
 }
 
 /// Schema entry for central blob
+#[derive(Clone)]
 #[allow(dead_code)]
 pub(crate) struct CentralSchemaEntry {
     pub id: u64,

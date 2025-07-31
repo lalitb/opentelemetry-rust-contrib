@@ -21,12 +21,25 @@ const FIELD_SEVERITY_TEXT: &str = "SeverityText";
 const FIELD_BODY: &str = "body";
 
 /// Encoder to write OTLP payload in bond form.
-#[derive(Clone)]
-pub(crate) struct OtlpEncoder;
+pub(crate) struct OtlpEncoder {
+    // Cache for timestamp formatting to avoid repeated allocations (thread-safe)
+    timestamp_cache: std::sync::RwLock<Option<(u64, String)>>,
+}
+
+impl Clone for OtlpEncoder {
+    fn clone(&self) -> Self {
+        // Create a new encoder with empty cache for the clone
+        OtlpEncoder {
+            timestamp_cache: std::sync::RwLock::new(None),
+        }
+    }
+}
 
 impl OtlpEncoder {
     pub(crate) fn new() -> Self {
-        OtlpEncoder {}
+        OtlpEncoder {
+            timestamp_cache: std::sync::RwLock::new(None),
+        }
     }
 
     /// Encode a batch of logs into a vector of (event_name, bytes, schema_ids, start_time_nanos, end_time_nanos)
@@ -70,9 +83,12 @@ impl OtlpEncoder {
             }
         }
 
-        let mut batches: HashMap<String, BatchData> = HashMap::new();
+        // Pre-count logs to estimate batch count and avoid HashMap resizing
+        let logs_vec: Vec<_> = logs.into_iter().collect();
+        let estimated_batches = (logs_vec.len() / 10).max(1).min(16); // Estimate 1-16 unique event names
+        let mut batches: HashMap<String, BatchData> = HashMap::with_capacity(estimated_batches);
 
-        for log_record in logs {
+        for log_record in logs_vec {
             // Get the timestamp - prefer time_unix_nano, fall back to observed_time_unix_nano if time_unix_nano is 0
             let timestamp = if log_record.time_unix_nano != 0 {
                 log_record.time_unix_nano
@@ -91,7 +107,6 @@ impl OtlpEncoder {
             let (field_info, schema_id) =
                 Self::determine_fields_and_schema_id(log_record, event_name_str);
 
-            let schema_entry = Self::create_schema(schema_id, field_info.as_slice());
             // 2. Encode row
             let row_buffer = self.write_row_data(log_record, &field_info);
             let level = log_record.severity_number as u8;
@@ -115,8 +130,9 @@ impl OtlpEncoder {
                 entry.metadata.end_time = entry.metadata.end_time.max(timestamp);
             }
 
-            // 4. Add schema entry if not already present (multiple schemas per event_name batch)
+            // 4. Add schema entry ONLY if not already present (avoid duplicate schema creation)
             if !entry.schemas.iter().any(|s| s.id == schema_id) {
+                let schema_entry = Self::create_schema(schema_id, field_info.as_slice());
                 entry.schemas.push(schema_entry);
             }
 
@@ -161,10 +177,6 @@ impl OtlpEncoder {
         // Pre-allocate with estimated capacity to avoid reallocations
         let estimated_capacity = 7 + 4 + log.attributes.len();
         let mut fields = Vec::with_capacity(estimated_capacity);
-
-        // Initialize hasher for schema ID calculation
-        let mut hasher = DefaultHasher::new();
-        event_name.hash(&mut hasher);
 
         // Part A - Always present fields
         fields.push((Cow::Borrowed(FIELD_ENV_NAME), BondDataType::BT_STRING));
@@ -216,12 +228,17 @@ impl OtlpEncoder {
         // Sort fields by name for consistent schema ID generation
         fields.sort_by(|a, b| a.0.cmp(&b.0));
 
+        // Calculate schema ID based ONLY on structure (field names + types + event_name)
+        // This ensures identical log structures get the same schema ID regardless of field values
+        let mut hasher = DefaultHasher::new();
+        event_name.hash(&mut hasher);
+        
         // Hash field names and types while converting to FieldDef
         let field_defs: Vec<FieldDef> = fields
             .into_iter()
             .enumerate()
             .map(|(i, (name, type_id))| {
-                // Hash field name and type for schema ID
+                // Hash field name and type for schema ID (not field values!)
                 name.hash(&mut hasher);
                 type_id.hash(&mut hasher);
 
@@ -254,7 +271,29 @@ impl OtlpEncoder {
 
     /// Write row data directly from LogRecord
     fn write_row_data(&self, log: &LogRecord, sorted_fields: &[FieldDef]) -> Vec<u8> {
-        let mut buffer = Vec::with_capacity(sorted_fields.len() * 50); //TODO - estimate better
+        // Better capacity estimation based on field types and content
+        let estimated_size = sorted_fields.iter().map(|field| {
+            match field.name.as_ref() {
+                FIELD_ENV_NAME | FIELD_ENV_VER => 20,
+                FIELD_TIMESTAMP | FIELD_ENV_TIME => 35, // RFC3339 timestamp length
+                FIELD_TRACE_ID => 40,                   // 32 hex chars + overhead
+                FIELD_SPAN_ID => 20,                    // 16 hex chars + overhead
+                FIELD_TRACE_FLAGS => 8,                 // int32 + overhead
+                FIELD_NAME => log.event_name.len() + 8,
+                FIELD_SEVERITY_NUMBER => 8,
+                FIELD_SEVERITY_TEXT => log.severity_text.len() + 8,
+                FIELD_BODY => log.body.as_ref()
+                    .and_then(|b| b.value.as_ref())
+                    .map(|v| match v {
+                        opentelemetry_proto::tonic::common::v1::any_value::Value::StringValue(s) => s.len() + 8,
+                        _ => 16
+                    })
+                    .unwrap_or(0),
+                _ => 32, // Dynamic attributes average size
+            }
+        }).sum::<usize>() + 64; // Extra buffer for encoding overhead
+        
+        let mut buffer = Vec::with_capacity(estimated_size);
 
         for field in sorted_fields {
             match field.name.as_ref() {
@@ -267,7 +306,7 @@ impl OtlpEncoder {
                     } else {
                         log.observed_time_unix_nano
                     };
-                    let dt = Self::format_timestamp(timestamp_nanos);
+                    let dt = self.format_timestamp_cached(timestamp_nanos);
                     BondWriter::write_string(&mut buffer, &dt);
                 }
                 FIELD_TRACE_ID => {
@@ -317,6 +356,28 @@ impl OtlpEncoder {
         let mut hex_bytes = [0u8; N];
         hex::encode_to_slice(id, &mut hex_bytes).unwrap();
         hex_bytes
+    }
+
+    /// Cached timestamp formatting to reduce allocations (thread-safe)
+    fn format_timestamp_cached(&self, nanos: u64) -> String {
+        // Try read lock first for cache hit
+        if let Ok(cache) = self.timestamp_cache.read() {
+            if let Some((cached_nanos, cached_str)) = cache.as_ref() {
+                if *cached_nanos == nanos {
+                    return cached_str.clone();
+                }
+            }
+        }
+        
+        // Cache miss or lock error - format and update cache
+        let formatted = Self::format_timestamp(nanos);
+        
+        // Try to update cache (don't block if lock fails)
+        if let Ok(mut cache) = self.timestamp_cache.write() {
+            *cache = Some((nanos, formatted.clone()));
+        }
+        
+        formatted
     }
 
     /// Format timestamp from nanoseconds
