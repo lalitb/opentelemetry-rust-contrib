@@ -124,7 +124,8 @@ impl DynamicSchema {
 
     /// Encode the schema to Bond format
     pub(crate) fn encode(&self) -> Result<Vec<u8>> {
-        let mut schema_bytes = Vec::new();
+        let estimated_size = 200 + self.fields.len() * 80; // Rough estimate
+        let mut schema_bytes = Vec::with_capacity(estimated_size);
 
         // Write header
         schema_bytes.write_all(&[0x53, 0x50])?; // 'S','P'
