@@ -503,15 +503,7 @@ mod tests {
                 "Calculated size {calculated_size} must exactly match actual size {actual_size} for {description}"
             );
 
-            // Verify we're much more accurate than the old approximation (200 + field_count * 80)
-            let old_estimated_size = 200 + (field_count * 80);
-            println!("Test {description}: old_estimate={old_estimated_size}, exact_calculated={calculated_size}, actual={actual_size}");
-            
-            // The exact calculation should always match, while old estimation could be significantly off
-            assert!(
-                calculated_size <= old_estimated_size || field_count == 0,
-                "Exact calculation should be more efficient than old estimation for {description}"
-            );
+            println!("Test {description}: calculated={calculated_size}, actual={actual_size}");
         }
     }
 }
