@@ -1,3 +1,4 @@
+use crate::buffer_pool::get_row_data_buffer;
 use crate::payload_encoder::bond_encoder::{BondDataType, BondEncodedSchema, BondWriter, FieldDef};
 use crate::payload_encoder::central_blob::{
     BatchMetadata, CentralBlob, CentralEventEntry, CentralSchemaEntry, EncodedBatch,
@@ -252,14 +253,19 @@ impl OtlpEncoder {
         }
     }
 
-    /// Write row data directly from LogRecord
+    /// Write row data directly from LogRecord using thread-local buffer pool
     fn write_row_data(&self, log: &LogRecord, sorted_fields: &[FieldDef]) -> Vec<u8> {
-        let mut buffer = Vec::with_capacity(sorted_fields.len() * 50); //TODO - estimate better
+        // Estimate capacity for row data encoding
+        let estimated_capacity = sorted_fields.len() * 50; // Rough estimate per field
+
+        // Get pooled buffer for row data encoding
+        let mut pooled_buffer = get_row_data_buffer(estimated_capacity);
+        let buffer = pooled_buffer.as_mut();
 
         for field in sorted_fields {
             match field.name.as_ref() {
-                FIELD_ENV_NAME => BondWriter::write_string(&mut buffer, "TestEnv"), // TODO - placeholder for actual env name
-                FIELD_ENV_VER => BondWriter::write_string(&mut buffer, "4.0"), // TODO - placeholder for actual env version
+                FIELD_ENV_NAME => BondWriter::write_string(buffer, "TestEnv"), // TODO - placeholder for actual env name
+                FIELD_ENV_VER => BondWriter::write_string(buffer, "4.0"), // TODO - placeholder for actual env version
                 FIELD_TIMESTAMP | FIELD_ENV_TIME => {
                     // Use the same timestamp precedence logic: prefer time_unix_nano, fall back to observed_time_unix_nano
                     let timestamp_nanos = if log.time_unix_nano != 0 {
@@ -268,35 +274,33 @@ impl OtlpEncoder {
                         log.observed_time_unix_nano
                     };
                     let dt = Self::format_timestamp(timestamp_nanos);
-                    BondWriter::write_string(&mut buffer, &dt);
+                    BondWriter::write_string(buffer, &dt);
                 }
                 FIELD_TRACE_ID => {
                     let hex_bytes = Self::encode_id_to_hex::<32>(&log.trace_id);
                     let hex_str = std::str::from_utf8(&hex_bytes).unwrap();
-                    BondWriter::write_string(&mut buffer, hex_str);
+                    BondWriter::write_string(buffer, hex_str);
                 }
                 FIELD_SPAN_ID => {
                     let hex_bytes = Self::encode_id_to_hex::<16>(&log.span_id);
                     let hex_str = std::str::from_utf8(&hex_bytes).unwrap();
-                    BondWriter::write_string(&mut buffer, hex_str);
+                    BondWriter::write_string(buffer, hex_str);
                 }
                 FIELD_TRACE_FLAGS => {
-                    BondWriter::write_numeric(&mut buffer, log.flags as i32);
+                    BondWriter::write_numeric(buffer, log.flags as i32);
                 }
                 FIELD_NAME => {
-                    BondWriter::write_string(&mut buffer, &log.event_name);
+                    BondWriter::write_string(buffer, &log.event_name);
                 }
-                FIELD_SEVERITY_NUMBER => {
-                    BondWriter::write_numeric(&mut buffer, log.severity_number)
-                }
+                FIELD_SEVERITY_NUMBER => BondWriter::write_numeric(buffer, log.severity_number),
                 FIELD_SEVERITY_TEXT => {
-                    BondWriter::write_string(&mut buffer, &log.severity_text);
+                    BondWriter::write_string(buffer, &log.severity_text);
                 }
                 FIELD_BODY => {
                     // TODO - handle all types of body values - For now, we only handle string values
                     if let Some(body) = &log.body {
                         if let Some(Value::StringValue(s)) = &body.value {
-                            BondWriter::write_string(&mut buffer, s);
+                            BondWriter::write_string(buffer, s);
                         }
                     }
                 }
@@ -304,13 +308,14 @@ impl OtlpEncoder {
                     // Handle dynamic attributes
                     // TODO - optimize better - we could update determine_fields to also return a vec of bytes which has bond serialized attributes
                     if let Some(attr) = log.attributes.iter().find(|a| a.key == field.name) {
-                        self.write_attribute_value(&mut buffer, attr, field.type_id);
+                        self.write_attribute_value(buffer, attr, field.type_id);
                     }
                 }
             }
         }
 
-        buffer
+        // Take ownership and return final buffer (automatic pool return on drop)
+        pooled_buffer.take()
     }
 
     fn encode_id_to_hex<const N: usize>(id: &[u8]) -> [u8; N] {

@@ -1,3 +1,4 @@
+mod buffer_pool;
 mod config_service;
 mod ingestion_service;
 pub mod payload_encoder;

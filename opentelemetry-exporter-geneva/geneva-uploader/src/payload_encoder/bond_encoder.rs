@@ -1,5 +1,6 @@
 // bond_encoder.rs - Pure Rust Bond encoder for dynamic OTLP schemas
 
+use crate::buffer_pool::get_schema_buffer;
 use std::borrow::Cow;
 use std::io::{Result, Write};
 use std::sync::Arc;
@@ -122,9 +123,14 @@ impl DynamicSchema {
         }
     }
 
-    /// Encode the schema to Bond format
+    /// Encode the schema to Bond format using thread-local buffer pool
     pub(crate) fn encode(&self) -> Result<Vec<u8>> {
-        let mut schema_bytes = Vec::new();
+        // Get estimated capacity for schema encoding
+        let estimated_size = 200 + (self.fields.len() * 80);
+
+        // Get pooled buffer for schema encoding
+        let mut pooled_buffer = get_schema_buffer(estimated_size);
+        let schema_bytes = pooled_buffer.as_mut();
 
         // Write header
         schema_bytes.write_all(&[0x53, 0x50])?; // 'S','P'
@@ -132,8 +138,8 @@ impl DynamicSchema {
         schema_bytes.write_all(&1u32.to_le_bytes())?; // num structs
 
         // Write struct definition
-        write_bond_string(&mut schema_bytes, &self.struct_name)?;
-        write_bond_string(&mut schema_bytes, &self.qualified_name)?;
+        write_bond_string(schema_bytes, &self.struct_name)?;
+        write_bond_string(schema_bytes, &self.qualified_name)?;
         schema_bytes.write_all(&0u32.to_le_bytes())?; // attributes
 
         // Modifier - 0 for Optional
@@ -159,7 +165,7 @@ impl DynamicSchema {
         // Write field definitions
         for (i, field) in self.fields.iter().enumerate() {
             let is_last = i == self.fields.len() - 1;
-            write_field_def(&mut schema_bytes, field, is_last)?;
+            write_field_def(schema_bytes, field, is_last)?;
         }
 
         // Padding to align to 8 bytes
@@ -175,7 +181,8 @@ impl DynamicSchema {
         // Final padding
         schema_bytes.write_all(&[0u8; 9])?;
 
-        Ok(schema_bytes)
+        // Take ownership and return final buffer (automatic pool return on drop)
+        Ok(pooled_buffer.take())
     }
 }
 
