@@ -116,9 +116,15 @@ pub(crate) struct DynamicSchema {
 
 impl DynamicSchema {
     pub(crate) fn new(name: &str, namespace: &str, fields: Vec<FieldDef>) -> Self {
+        // Avoid format! allocation by building qualified name manually
+        let mut qualified_name = String::with_capacity(namespace.len() + 1 + name.len());
+        qualified_name.push_str(namespace);
+        qualified_name.push('.');
+        qualified_name.push_str(name);
+        
         Self {
             struct_name: name.to_string(),
-            qualified_name: format!("{namespace}.{name}"),
+            qualified_name,
             fields,
         }
     }

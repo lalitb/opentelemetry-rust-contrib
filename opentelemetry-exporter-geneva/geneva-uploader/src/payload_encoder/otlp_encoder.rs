@@ -46,8 +46,6 @@ impl OtlpEncoder {
 
         impl BatchData {
             fn format_schema_ids(&self) -> String {
-                use std::fmt::Write;
-
                 if self.schemas.is_empty() {
                     return String::new();
                 }
@@ -57,17 +55,19 @@ impl OtlpEncoder {
                 let estimated_capacity =
                     self.schemas.len() * 32 + self.schemas.len().saturating_sub(1);
 
-                self.schemas.iter().enumerate().fold(
-                    String::with_capacity(estimated_capacity),
-                    |mut acc, (i, s)| {
-                        if i > 0 {
-                            acc.push(';');
-                        }
-                        let md5_hash = md5::compute(s.id.to_le_bytes());
-                        write!(&mut acc, "{md5_hash:x}").unwrap();
-                        acc
-                    },
-                )
+                let mut result = String::with_capacity(estimated_capacity);
+                
+                for (i, s) in self.schemas.iter().enumerate() {
+                    if i > 0 {
+                        result.push(';');
+                    }
+                    let md5_hash = md5::compute(s.id.to_le_bytes());
+                    // Use hex::encode_to_slice to avoid allocation
+                    let mut hex_buf = [0u8; 32];
+                    hex::encode_to_slice(md5_hash.as_ref(), &mut hex_buf).unwrap();
+                    result.push_str(std::str::from_utf8(&hex_buf).unwrap());
+                }
+                result
             }
         }
 
