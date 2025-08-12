@@ -507,11 +507,9 @@ fn extract_endpoint_from_token(token: &str) -> Result<String> {
     };
 
     // Decode the Base64-encoded payload into raw bytes
-    let decoded = general_purpose::URL_SAFE_NO_PAD
-        .decode(payload)
-        .map_err(|e| {
-            GenevaConfigClientError::JwtTokenError(format!("Failed to decode JWT: {e}"))
-        })?;
+    let decoded = general_purpose::STANDARD.decode(payload).map_err(|e| {
+        GenevaConfigClientError::JwtTokenError(format!("Failed to decode JWT: {e}"))
+    })?;
 
     // Convert the raw bytes into a UTF-8 string
     let decoded_str = String::from_utf8(decoded).map_err(|e| {
