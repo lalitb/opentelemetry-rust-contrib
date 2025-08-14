@@ -11,7 +11,8 @@ extern "C" {
 
 // Opaque handles
 typedef struct GenevaClientHandle GenevaClientHandle;
-typedef struct EncodedBatchesHandle EncodedBatchesHandle;
+typedef struct GenevaBatchList    GenevaBatchList;   // list of encoded/compressed batches (chunks)
+typedef struct GenevaBatch        GenevaBatch;       // single batch (owned)
 
 // Authentication method constants
 #define GENEVA_AUTH_MANAGED_IDENTITY 0
@@ -57,36 +58,52 @@ typedef struct {
 GenevaError geneva_client_new(const GenevaConfig* config,
                               GenevaClientHandle** out_handle);
 
-
-/* 1) Encode and compress logs into batches (synchronous).
-      `data` is a protobuf-encoded ExportLogsServiceRequest.
-      - On success returns GENEVA_SUCCESS and writes *out_batches.
-      - On failure returns an error code.
-      Caller must free *out_batches with geneva_batches_free. */
-GenevaError geneva_encode_and_compress_logs(GenevaClientHandle* handle,
-                                            const uint8_t* data,
-                                            size_t data_len,
-                                            EncodedBatchesHandle** out_batches);
-
-// 2) Query number of batches.
-size_t geneva_batches_len(const EncodedBatchesHandle* batches);
-
-/* 3) Upload a single batch by index (synchronous).
-      - On success returns GENEVA_SUCCESS.
-      - On failure returns an error code. */
-GenevaError geneva_upload_batch_sync(GenevaClientHandle* handle,
-                                     const EncodedBatchesHandle* batches,
-                                     size_t index);
-
-
-/* 5) Free the batches handle. */
-void geneva_batches_free(EncodedBatchesHandle* batches);
-
-
-
 /* Frees a Geneva client handle */
 void geneva_client_free(GenevaClientHandle* handle);
 
+/* 1) Encode and compress logs into a list of batches (synchronous).
+      `data_ptr` is a protobuf-encoded ExportLogsServiceRequest.
+      - On success returns GENEVA_SUCCESS and writes *out_list.
+      - On failure returns an error code.
+      Caller must free *out_list with geneva_batches_free. */
+GenevaError geneva_encode_and_compress_logs_v2(GenevaClientHandle* client,
+                                               const uint8_t* data_ptr,
+                                               size_t data_len,
+                                               GenevaBatchList** out_list);
+
+/* 2) Query number of batches in the list. */
+size_t geneva_batches_len(const GenevaBatchList* list);
+
+/* 3) Upload a single batch by index (synchronous, no persistence). */
+GenevaError geneva_batch_upload_by_index_sync(GenevaClientHandle* client,
+                                              const GenevaBatchList* list,
+                                              size_t index);
+
+/* 4) Move out a single batch so you don’t keep the whole list.
+      Removes index from list (O(1) swap-remove) and returns a single-batch handle. */
+GenevaError geneva_batch_take(GenevaBatchList* list,
+                              size_t index,
+                              GenevaBatch** out_batch);
+
+/* 5) Upload / free the single-batch handle (synchronous upload). */
+GenevaError geneva_single_upload_sync(GenevaClientHandle* client,
+                                      const GenevaBatch* batch);
+void        geneva_single_free(GenevaBatch* batch);
+
+/* 6) Serialize one batch to a stable blob (caller-managed persistence).
+      Two-phase copy: if out_buf==NULL or *inout_len<needed, writes required size to *inout_len
+      and returns GENEVA_SUCCESS without copying. Caller retries with adequate buffer. */
+GenevaError geneva_batch_serialize(const GenevaBatch* batch,
+                                   uint8_t* out_buf,
+                                   size_t* inout_len);
+
+/* 7) Upload directly from a serialized blob (no need to reconstruct a batch handle). */
+GenevaError geneva_upload_serialized_batch_sync(GenevaClientHandle* client,
+                                                const uint8_t* blob_ptr,
+                                                size_t blob_len);
+
+/* 8) Free the batch list. */
+void geneva_batches_free(GenevaBatchList* list);
 
 #ifdef __cplusplus
 }

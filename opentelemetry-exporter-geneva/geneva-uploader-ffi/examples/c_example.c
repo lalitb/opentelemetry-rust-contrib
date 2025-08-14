@@ -5,7 +5,8 @@
  * - Reading configuration from environment
  * - Creating a Geneva client via geneva_client_new (out-param)
  * - Encoding/compressing ResourceLogs
- * - Uploading batches synchronously with geneva_upload_batch_sync
+ * - Uploading batches synchronously with geneva_batch_upload_by_index_sync
+ * - Persisting a batch to disk and later uploading from blob via geneva_upload_serialized_batch_sync
  *
  * Note: The non-blocking callback-based mechanism has been removed.
  */
@@ -127,22 +128,22 @@ int main(void) {
     }
 
     /* Encode and compress to batches */
-    EncodedBatchesHandle* batches = NULL;
-    GenevaError enc_rc = geneva_encode_and_compress_logs(client, data, data_len, &batches);
-    if (enc_rc != GENEVA_SUCCESS || batches == NULL) {
+    GenevaBatchList* list = NULL;
+    GenevaError enc_rc = geneva_encode_and_compress_logs_v2(client, data, data_len, &list);
+    if (enc_rc != GENEVA_SUCCESS || list == NULL) {
         printf("Encode/compress failed (code=%d)\n", enc_rc);
         geneva_free_buffer(data, data_len);
         geneva_client_free(client);
         return 1;
     }
 
-    size_t n = geneva_batches_len(batches);
+    size_t n = geneva_batches_len(list);
     printf("Encoded %zu batch(es)\n", n);
 
     /* Upload synchronously, batch by batch */
     GenevaError first_err = GENEVA_SUCCESS;
     for (size_t i = 0; i < n; i++) {
-        GenevaError r = geneva_upload_batch_sync(client, batches, i);
+        GenevaError r = geneva_batch_upload_by_index_sync(client, list, i);
         if (r != GENEVA_SUCCESS) {
             first_err = r;
             printf("Batch %zu upload failed with error %d\n", i, r);
@@ -150,8 +151,59 @@ int main(void) {
         }
     }
 
+    /* Persist first batch to a file and later upload from disk */
+    if (n > 0) {
+        const char* blob_path = get_env_or_default("GENEVA_BLOB_PATH", "geneva_blob.gnvb");
+        GenevaBatch* single = NULL;
+        GenevaError trc = geneva_batch_take(list, 0, &single);
+        if (trc == GENEVA_SUCCESS && single != NULL) {
+            size_t needed = 0;
+            GenevaError src = geneva_batch_serialize(single, NULL, &needed);
+            if (src == GENEVA_SUCCESS && needed > 0) {
+                uint8_t* buf = (uint8_t*)malloc(needed);
+                if (buf) {
+                    size_t len = needed;
+                    src = geneva_batch_serialize(single, buf, &len);
+                    if (src == GENEVA_SUCCESS) {
+                        FILE* fp = fopen(blob_path, "wb");
+                        if (fp) {
+                            size_t wrote = fwrite(buf, 1, len, fp);
+                            fclose(fp);
+                            printf("Persisted %zu bytes to %s\n", wrote, blob_path);
+
+                            /* Read back and upload from blob */
+                            fp = fopen(blob_path, "rb");
+                            if (fp) {
+                                if (fseek(fp, 0, SEEK_END) == 0) {
+                                    long flen = ftell(fp);
+                                    if (flen > 0 && fseek(fp, 0, SEEK_SET) == 0) {
+                                        uint8_t* rbuf = (uint8_t*)malloc((size_t)flen);
+                                        if (rbuf) {
+                                            size_t rd = fread(rbuf, 1, (size_t)flen, fp);
+                                            if (rd == (size_t)flen) {
+                                                GenevaError urc = geneva_upload_serialized_batch_sync(client, rbuf, (size_t)flen);
+                                                printf("Upload-from-blob returned %d\n", urc);
+                                                if (first_err == GENEVA_SUCCESS && urc != GENEVA_SUCCESS) {
+                                                    first_err = urc;
+                                                }
+                                            }
+                                            free(rbuf);
+                                        }
+                                    }
+                                }
+                                fclose(fp);
+                            }
+                        }
+                    }
+                    free(buf);
+                }
+            }
+            geneva_single_free(single);
+        }
+    }
+
     /* Cleanup */
-    geneva_batches_free(batches);
+    geneva_batches_free(list);
     geneva_free_buffer(data, data_len);
     geneva_client_free(client);
 

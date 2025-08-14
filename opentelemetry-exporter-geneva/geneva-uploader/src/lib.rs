@@ -19,4 +19,5 @@ pub(crate) use ingestion_service::uploader::{
 
 pub use client::EncodedBatch;
 pub use client::{GenevaClient, GenevaClientConfig};
+pub use payload_encoder::central_blob::BatchMetadata;
 pub use config_service::client::AuthMethod;
