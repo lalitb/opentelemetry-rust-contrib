@@ -71,6 +71,7 @@ impl GenevaClient {
             namespace: cfg.namespace.clone(),
             source_identity,
             environment: cfg.environment,
+            encoded_source_identity: String::new(), // Will be populated during initialization
             config_version: config_version.clone(),
         };
 
