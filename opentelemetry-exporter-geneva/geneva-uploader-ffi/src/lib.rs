@@ -457,7 +457,7 @@ pub unsafe extern "C" fn geneva_upload_batch_sync(
         return GenevaError::IndexOutOfRange;
     }
 
-    let batch = &batches_ref.batches[index];
+    let batch = batches_ref.batches[index].clone();
     let client = &handle_ref.client;
     let res = runtime().block_on(async move { client.upload_batch(batch).await });
     match res {

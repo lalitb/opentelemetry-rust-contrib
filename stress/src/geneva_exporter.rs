@@ -272,7 +272,7 @@ async fn async_main(
     let warm_batches = client
         .encode_and_compress_logs(&logs)
         .map_err(|e| format!("Failed to encode logs: {e}"))?;
-    for batch in &warm_batches {
+    for batch in warm_batches {
         client
             .upload_batch(batch)
             .await
@@ -299,7 +299,7 @@ async fn async_main(
                     let batches = client.encode_and_compress_logs(&logs)?;
 
                     // Upload batches sequentially TODO - use buffer_unordered for concurrency
-                    for batch in &batches {
+                    for batch in batches {
                         client
                             .upload_batch(batch)
                             .await
@@ -333,7 +333,7 @@ async fn async_main(
                         .map_err(|e| format!("Failed to encode logs: {e}"))?;
 
                     // Upload batches sequentially - TODO - use buffer_unordered for concurrency
-                    for batch in &batches {
+                    for batch in batches {
                         client
                             .upload_batch(batch)
                             .await
@@ -363,7 +363,7 @@ async fn async_main(
                             Ok(batches) => batches,
                             Err(e) => return Err(format!("Failed to encode logs: {e}")),
                         };
-                        for batch in &batches {
+                        for batch in batches {
                             if let Err(e) = client.upload_batch(batch).await {
                                 return Err(format!("Failed to upload batch: {e}"));
                             }

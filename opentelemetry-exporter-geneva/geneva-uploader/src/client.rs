@@ -101,9 +101,9 @@ impl GenevaClient {
 
     /// Upload a single compressed batch.
     /// This allows for granular control over uploads, including custom retry logic for individual batches.
-    pub async fn upload_batch(&self, batch: &EncodedBatch) -> Result<(), String> {
+    pub async fn upload_batch(&self, batch: EncodedBatch) -> Result<(), String> {
         self.uploader
-            .upload(batch.data.clone(), &batch.event_name, &batch.metadata)
+            .upload(batch.data, &batch.event_name, &batch.metadata)
             .await
             .map(|_| ())
             .map_err(|e| format!("Geneva upload failed: {e} Event: {}", batch.event_name))

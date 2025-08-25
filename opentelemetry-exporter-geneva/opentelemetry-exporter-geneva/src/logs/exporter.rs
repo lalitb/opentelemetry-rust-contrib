@@ -60,7 +60,7 @@ impl opentelemetry_sdk::logs::LogExporter for GenevaExporter {
         let errors: Vec<String> = stream::iter(compressed_batches)
             .map(|batch| {
                 let client = self.geneva_client.clone();
-                async move { client.upload_batch(&batch).await }
+                async move { client.upload_batch(batch).await }
             })
             .buffer_unordered(self.max_concurrent_uploads)
             .filter_map(|result| async move { result.err() })
