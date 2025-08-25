@@ -95,9 +95,8 @@ impl OtlpEncoder {
                 log_record.event_name.as_str()
             };
 
-            // 1. Get schema with optimized single-pass field collection and schema ID calculation
-            let (field_info, schema_id) =
-                Self::determine_fields_and_schema_id(log_record, event_name_str);
+            // 1. Get schema field definitions (no hash calculation needed)
+            let field_info = Self::determine_fields(log_record, event_name_str);
 
             // 2. Encode row
             let row_buffer = self.write_row_data(log_record, &field_info);
@@ -122,11 +121,17 @@ impl OtlpEncoder {
                 entry.metadata.end_time = entry.metadata.end_time.max(timestamp);
             }
 
-            // 4. Add schema entry if not already present (multiple schemas per event_name batch)
-            if !entry.schemas.iter().any(|s| s.id == schema_id) {
-                let schema_entry = Self::create_schema(schema_id, field_info);
+            // 4. Find existing schema or create new one with sequential ID
+            let schema_id = if let Some(existing_schema) = entry.schemas.iter().find(|s| s.matches_fields(&field_info)) {
+                // Reuse existing schema
+                existing_schema.id
+            } else {
+                // Create new schema with sequential ID (1-based)
+                let new_schema_id = (entry.schemas.len() + 1) as u64;
+                let schema_entry = Self::create_schema(new_schema_id, field_info);
                 entry.schemas.push(schema_entry);
-            }
+                new_schema_id
+            };
 
             // 5. Create CentralEventEntry directly (optimization: no intermediate EncodedRow)
             let central_event = CentralEventEntry {
@@ -163,18 +168,11 @@ impl OtlpEncoder {
         Ok(blobs)
     }
 
-    /// Determine fields and calculate schema ID in a single pass for optimal performance
-    fn determine_fields_and_schema_id(log: &LogRecord, event_name: &str) -> (Vec<FieldDef>, u64) {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
+    /// Determine field definitions from log record and event name
+    fn determine_fields(log: &LogRecord, _event_name: &str) -> Vec<FieldDef> {
         // Pre-allocate with estimated capacity to avoid reallocations
         let estimated_capacity = 7 + 4 + log.attributes.len();
         let mut fields = Vec::with_capacity(estimated_capacity);
-
-        // Initialize hasher for schema ID calculation
-        let mut hasher = DefaultHasher::new();
-        event_name.hash(&mut hasher);
 
         // Part A - Always present fields
         fields.push((Cow::Borrowed(FIELD_ENV_NAME), BondDataType::BT_STRING));
@@ -223,16 +221,11 @@ impl OtlpEncoder {
             }
         }
 
-        // No sorting - field order affects schema ID calculation
-        // Hash field names and types while converting to FieldDef
+        // Convert to FieldDef with sequential field IDs
         let field_defs: Vec<FieldDef> = fields
             .into_iter()
             .enumerate()
             .map(|(i, (name, type_id))| {
-                // Hash field name and type for schema ID
-                name.hash(&mut hasher);
-                type_id.hash(&mut hasher);
-
                 FieldDef {
                     name,
                     type_id,
@@ -241,13 +234,12 @@ impl OtlpEncoder {
             })
             .collect();
 
-        let schema_id = hasher.finish();
-        (field_defs, schema_id)
+        field_defs
     }
 
     /// Create schema - always creates a new CentralSchemaEntry
     fn create_schema(schema_id: u64, field_info: Vec<FieldDef>) -> CentralSchemaEntry {
-        let schema = BondEncodedSchema::from_fields("OtlpLogRecord", "telemetry", field_info); //TODO - use actual struct name and namespace
+        let schema = BondEncodedSchema::from_fields("OtlpLogRecord", "telemetry", field_info.clone()); //TODO - use actual struct name and namespace
 
         let schema_bytes = schema.as_bytes();
         let schema_md5 = md5::compute(schema_bytes).0;
@@ -256,6 +248,7 @@ impl OtlpEncoder {
             id: schema_id,
             md5: schema_md5,
             schema,
+            fields: field_info, // Store field definitions for comparison
         }
     }
 

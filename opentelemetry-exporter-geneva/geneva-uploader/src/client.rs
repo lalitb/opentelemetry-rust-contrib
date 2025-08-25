@@ -70,6 +70,7 @@ impl GenevaClient {
         let uploader_config = GenevaUploaderConfig {
             namespace: cfg.namespace.clone(),
             source_identity,
+            encoded_source_identity: String::new(), // Will be populated during initialization
             environment: cfg.environment,
             config_version: config_version.clone(),
         };

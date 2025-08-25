@@ -49,6 +49,7 @@ mod tests {
             let uploader_config = GenevaUploaderConfig {
                 namespace: namespace.clone(),
                 source_identity,
+                encoded_source_identity: String::new(), // Will be populated during initialization
                 environment: environment.clone(),
                 config_version,
             };

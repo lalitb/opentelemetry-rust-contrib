@@ -72,6 +72,17 @@ pub(crate) struct CentralSchemaEntry {
     pub id: u64,
     pub md5: [u8; 16],
     pub schema: BondEncodedSchema,
+    pub fields: Vec<super::bond_encoder::FieldDef>, // Store original field definitions for comparison
+}
+
+impl CentralSchemaEntry {
+    /// Check if this schema matches the given field definitions
+    pub(crate) fn matches_fields(&self, fields: &[super::bond_encoder::FieldDef]) -> bool {
+        self.fields.len() == fields.len() &&
+        self.fields.iter().zip(fields.iter()).all(|(schema_field, field_def)| {
+            schema_field.name == field_def.name && schema_field.type_id == field_def.type_id
+        })
+    }
 }
 
 /// Event/row entry for central blob
@@ -250,7 +261,7 @@ mod tests {
                 field_id: 2u16,
             },
         ];
-        let schema_obj = BondEncodedSchema::from_fields("TestStruct", "test.namespace", fields);
+        let schema_obj = BondEncodedSchema::from_fields("TestStruct", "test.namespace", fields.clone());
         let schema_bytes = schema_obj.as_bytes().to_vec();
         let schema_md5 = md5_bytes(&schema_bytes);
         let schema_id = 1234u64;
@@ -259,6 +270,7 @@ mod tests {
             id: schema_id,
             md5: schema_md5,
             schema: schema_obj,
+            fields, // Store field definitions for comparison
         };
 
         // Prepare a row

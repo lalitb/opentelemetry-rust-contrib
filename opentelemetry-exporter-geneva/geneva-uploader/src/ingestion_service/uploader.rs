@@ -103,6 +103,7 @@ pub(crate) struct IngestionResponse {
 pub(crate) struct GenevaUploaderConfig {
     pub namespace: String,
     pub source_identity: String,
+    pub encoded_source_identity: String,
     #[allow(dead_code)]
     pub environment: String,
     pub config_version: String,
@@ -128,8 +129,12 @@ impl GenevaUploader {
     #[allow(dead_code)]
     pub(crate) fn from_config_client(
         config_client: Arc<GenevaConfigClient>,
-        uploader_config: GenevaUploaderConfig,
+        mut uploader_config: GenevaUploaderConfig,
     ) -> Result<Self> {
+        // Pre-encode source_identity during initialization to avoid repeated encoding on every upload
+        uploader_config.encoded_source_identity = 
+            byte_serialize(uploader_config.source_identity.as_bytes()).collect();
+
         let mut headers = header::HeaderMap::new();
         headers.insert(
             header::ACCEPT,
@@ -162,12 +167,11 @@ impl GenevaUploader {
         let start_time_str = metadata.format_start_timestamp();
         let end_time_str = metadata.format_end_timestamp();
 
-        // URL encode parameters
-        // TODO - Maintain this as url-encoded in config service to avoid conversion here
+        // URL encode monitoring_endpoint (which can change between calls)
         let encoded_monitoring_endpoint: String =
             byte_serialize(monitoring_endpoint.as_bytes()).collect();
-        let encoded_source_identity: String =
-            byte_serialize(self.config.source_identity.as_bytes()).collect();
+        // Use pre-encoded source_identity to avoid repeated encoding
+        let encoded_source_identity = &self.config.encoded_source_identity;
 
         // Create a source unique ID - using a UUID to ensure uniqueness
         let source_unique_id = Uuid::new_v4();
