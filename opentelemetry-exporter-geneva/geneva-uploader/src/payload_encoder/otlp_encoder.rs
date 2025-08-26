@@ -9,6 +9,7 @@ use opentelemetry_proto::tonic::common::v1::any_value::Value;
 use opentelemetry_proto::tonic::logs::v1::LogRecord;
 use std::borrow::Cow;
 use std::sync::Arc;
+use std::collections::HashMap;
 
 const FIELD_ENV_NAME: &str = "env_name";
 const FIELD_ENV_VER: &str = "env_ver";
@@ -49,6 +50,8 @@ impl OtlpEncoder {
             schemas: Vec<CentralSchemaEntry>,
             events: Vec<CentralEventEntry>,
             metadata: BatchMetadata,
+            schema_key_to_id: HashMap<String, u64>,
+            next_schema_id: u64,
         }
 
         impl BatchData {
@@ -96,7 +99,7 @@ impl OtlpEncoder {
             };
 
             // 1. Get schema with optimized single-pass field collection and schema ID calculation
-            let (field_info, schema_id) =
+            let (field_info, schema_key) =
                 Self::determine_fields_and_schema_id(log_record, event_name_str);
 
             // 2. Encode row
@@ -114,6 +117,8 @@ impl OtlpEncoder {
                         end_time: timestamp,
                         schema_ids: String::new(),
                     },
+                    schema_key_to_id: HashMap::new(),
+                    next_schema_id: 1,
                 });
 
             // Update timestamp range
@@ -122,11 +127,17 @@ impl OtlpEncoder {
                 entry.metadata.end_time = entry.metadata.end_time.max(timestamp);
             }
 
-            // 4. Add schema entry if not already present (multiple schemas per event_name batch)
-            if !entry.schemas.iter().any(|s| s.id == schema_id) {
-                let schema_entry = Self::create_schema(schema_id, field_info);
+            // 4. Resolve/assign schema id sequential within this batch (no global cache)
+            let schema_id = if let Some(id) = entry.schema_key_to_id.get(&schema_key) {
+                *id
+            } else {
+                let id = entry.next_schema_id;
+                entry.next_schema_id += 1;
+                entry.schema_key_to_id.insert(schema_key.clone(), id);
+                let schema_entry = Self::create_schema(id, field_info);
                 entry.schemas.push(schema_entry);
-            }
+                id
+            };
 
             // 5. Create CentralEventEntry directly (optimization: no intermediate EncodedRow)
             let central_event = CentralEventEntry {
@@ -164,17 +175,10 @@ impl OtlpEncoder {
     }
 
     /// Determine fields and calculate schema ID in a single pass for optimal performance
-    fn determine_fields_and_schema_id(log: &LogRecord, event_name: &str) -> (Vec<FieldDef>, u64) {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
+    fn determine_fields_and_schema_id(log: &LogRecord, event_name: &str) -> (Vec<FieldDef>, String) {
         // Pre-allocate with estimated capacity to avoid reallocations
         let estimated_capacity = 7 + 4 + log.attributes.len();
         let mut fields = Vec::with_capacity(estimated_capacity);
-
-        // Initialize hasher for schema ID calculation
-        let mut hasher = DefaultHasher::new();
-        event_name.hash(&mut hasher);
 
         // Part A - Always present fields
         fields.push((Cow::Borrowed(FIELD_ENV_NAME), BondDataType::BT_STRING));
@@ -224,25 +228,28 @@ impl OtlpEncoder {
         }
 
         // No sorting - field order affects schema ID calculation
-        // Hash field names and types while converting to FieldDef
+        // Convert collected (name,type) pairs into FieldDef preserving order (order influences key)
         let field_defs: Vec<FieldDef> = fields
             .into_iter()
             .enumerate()
-            .map(|(i, (name, type_id))| {
-                // Hash field name and type for schema ID
-                name.hash(&mut hasher);
-                type_id.hash(&mut hasher);
-
-                FieldDef {
-                    name,
-                    type_id,
-                    field_id: (i + 1) as u16,
-                }
+            .map(|(i, (name, type_id))| FieldDef {
+                name,
+                type_id,
+                field_id: (i + 1) as u16,
             })
             .collect();
 
-        let schema_id = hasher.finish();
-        (field_defs, schema_id)
+        // Build a deterministic schema key (event_name + ordered field name/type pairs)
+        let mut key = String::with_capacity(event_name.len() + field_defs.len() * 24);
+        key.push_str(event_name);
+        key.push('|');
+        for fd in &field_defs {
+            key.push_str(fd.name.as_ref());
+            key.push('#');
+            key.push_str(&format!("{:?}", fd.type_id));
+            key.push(';');
+        }
+        (field_defs, key)
     }
 
     /// Create schema - always creates a new CentralSchemaEntry
