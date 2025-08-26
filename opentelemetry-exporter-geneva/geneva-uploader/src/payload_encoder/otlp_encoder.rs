@@ -1,14 +1,11 @@
 use crate::client::EncodedBatch;
 use crate::payload_encoder::bond_encoder::{BondDataType, BondEncodedSchema, BondWriter, FieldDef};
-use crate::payload_encoder::central_blob::{
-    BatchMetadata, CentralBlob, CentralEventEntry, CentralSchemaEntry,
-};
+use crate::payload_encoder::central_blob::{BatchMetadata, CentralBlob};
 use crate::payload_encoder::lz4_chunked_compression::lz4_chunked_compression;
 use chrono::{TimeZone, Utc};
 use opentelemetry_proto::tonic::common::v1::any_value::Value;
 use opentelemetry_proto::tonic::logs::v1::LogRecord;
 use std::borrow::Cow;
-use std::sync::Arc;
 
 const FIELD_ENV_NAME: &str = "env_name";
 const FIELD_ENV_VER: &str = "env_ver";
@@ -46,35 +43,26 @@ impl OtlpEncoder {
 
         // Internal struct to accumulate batch data before encoding
         struct BatchData {
-            schemas: Vec<CentralSchemaEntry>,
-            events: Vec<CentralEventEntry>,
+            blob: CentralBlob,
             metadata: BatchMetadata,
         }
 
         impl BatchData {
             fn format_schema_ids(&self) -> String {
-                use std::fmt::Write;
-
-                if self.schemas.is_empty() {
+                let schema_ids = self.blob.get_schema_ids();
+                if schema_ids.is_empty() {
                     return String::new();
                 }
-
-                // Pre-allocate capacity: Each MD5 hash is 32 hex chars + 1 semicolon (except last)
-                // Total: (32 chars per hash * num_schemas) + (semicolons = num_schemas - 1)
-                let estimated_capacity =
-                    self.schemas.len() * 32 + self.schemas.len().saturating_sub(1);
-
-                self.schemas.iter().enumerate().fold(
-                    String::with_capacity(estimated_capacity),
-                    |mut acc, (i, s)| {
-                        if i > 0 {
-                            acc.push(';');
-                        }
-                        let md5_hash = md5::compute(s.id.to_le_bytes());
-                        write!(&mut acc, "{md5_hash:x}").unwrap();
-                        acc
-                    },
-                )
+                // Generate MD5 hashes of the schema IDs for backward compatibility
+                // while keeping the collision-safe sequential IDs internally
+                schema_ids
+                    .iter()
+                    .map(|id| {
+                        let md5_hash = md5::compute(id.to_le_bytes());
+                        format!("{md5_hash:x}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(";")
             }
         }
 
@@ -96,7 +84,7 @@ impl OtlpEncoder {
             };
 
             // 1. Get schema with optimized single-pass field collection and schema ID calculation
-            let (field_info, schema_id) =
+            let (field_info, _schema_id) =
                 Self::determine_fields_and_schema_id(log_record, event_name_str);
 
             // 2. Encode row
@@ -107,8 +95,7 @@ impl OtlpEncoder {
             let entry = batches
                 .entry(event_name_str.to_string())
                 .or_insert_with(|| BatchData {
-                    schemas: Vec::new(),
-                    events: Vec::new(),
+                    blob: CentralBlob::new(1, 2, metadata.to_string()),
                     metadata: BatchMetadata {
                         start_time: timestamp,
                         end_time: timestamp,
@@ -122,20 +109,17 @@ impl OtlpEncoder {
                 entry.metadata.end_time = entry.metadata.end_time.max(timestamp);
             }
 
-            // 4. Add schema entry if not already present (multiple schemas per event_name batch)
-            if !entry.schemas.iter().any(|s| s.id == schema_id) {
-                let schema_entry = Self::create_schema(schema_id, field_info);
-                entry.schemas.push(schema_entry);
-            }
+            // 4. Add schema using collision-safe deduplication and create event
+            let schema = BondEncodedSchema::from_fields("OtlpLogRecord", "telemetry", field_info);
+            let actual_schema_id = entry.blob.add_schema(schema);
 
-            // 5. Create CentralEventEntry directly (optimization: no intermediate EncodedRow)
-            let central_event = CentralEventEntry {
-                schema_id,
+            // 5. Add event directly to the blob
+            entry.blob.add_event(
+                actual_schema_id,
                 level,
-                event_name: Arc::new(event_name_str.to_string()),
-                row: row_buffer,
-            };
-            entry.events.push(central_event);
+                event_name_str.to_string(),
+                row_buffer,
+            );
         }
 
         // 6. Encode blobs (one per event_name, potentially multiple schemas per blob)
@@ -144,13 +128,7 @@ impl OtlpEncoder {
             let schema_ids_string = batch_data.format_schema_ids();
             batch_data.metadata.schema_ids = schema_ids_string;
 
-            let blob = CentralBlob {
-                version: 1,
-                format: 2,
-                metadata: metadata.to_string(),
-                schemas: batch_data.schemas,
-                events: batch_data.events,
-            };
+            let blob = batch_data.blob;
             let uncompressed = blob.to_bytes();
             let compressed = lz4_chunked_compression(&uncompressed)
                 .map_err(|e| format!("compression failed: {e}"))?;
@@ -245,19 +223,7 @@ impl OtlpEncoder {
         (field_defs, schema_id)
     }
 
-    /// Create schema - always creates a new CentralSchemaEntry
-    fn create_schema(schema_id: u64, field_info: Vec<FieldDef>) -> CentralSchemaEntry {
-        let schema = BondEncodedSchema::from_fields("OtlpLogRecord", "telemetry", field_info); //TODO - use actual struct name and namespace
-
-        let schema_bytes = schema.as_bytes();
-        let schema_md5 = md5::compute(schema_bytes).0;
-
-        CentralSchemaEntry {
-            id: schema_id,
-            md5: schema_md5,
-            schema,
-        }
-    }
+    // Removed create_schema method - now handled by CentralBlob::add_schema
 
     /// Write row data directly from LogRecord
     fn write_row_data(&self, log: &LogRecord, sorted_fields: &[FieldDef]) -> Vec<u8> {

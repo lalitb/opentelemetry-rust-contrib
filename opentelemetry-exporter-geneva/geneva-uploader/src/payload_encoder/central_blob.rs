@@ -11,7 +11,7 @@ pub struct BatchMetadata {
     pub start_time: u64,
     /// End time of the latest event in nanoseconds since Unix epoch
     pub end_time: u64,
-    /// Schema IDs present in this batch formatted as MD5 hashes separated by semicolons
+    /// Schema IDs present in this batch formatted as semicolon-separated sequential IDs
     pub schema_ids: String,
 }
 
@@ -66,18 +66,27 @@ fn utf8_to_utf16le_bytes(s: &str) -> Vec<u8> {
     buf
 }
 
-/// Schema entry for central blob
-#[allow(dead_code)]
+/// Schema entry for central blob - collision-safe version using linear search
 pub(crate) struct CentralSchemaEntry {
-    pub id: u64,
-    pub md5: [u8; 16],
-    pub schema: BondEncodedSchema,
+    pub id: u64,                   // Sequential schema ID (1, 2, 3, ...)
+    pub schema: BondEncodedSchema, // Actual schema data
+}
+
+impl CentralSchemaEntry {
+    /// Create new schema entry
+    pub fn new(id: u64, schema: BondEncodedSchema) -> Self {
+        Self { id, schema }
+    }
+
+    /// Check if this entry matches given schema bytes (collision-safe comparison)
+    pub fn matches_schema(&self, other_schema_bytes: &[u8]) -> bool {
+        self.schema.as_bytes() == other_schema_bytes
+    }
 }
 
 /// Event/row entry for central blob
-#[allow(dead_code)]
 pub(crate) struct CentralEventEntry {
-    pub schema_id: u64,
+    pub schema_id: u64, // References CentralSchemaEntry.id
     pub level: u8,
     pub event_name: Arc<String>,
     pub row: Vec<u8>,
@@ -103,8 +112,7 @@ const TERMINATOR: u64 = 0xdeadc0dedeadc0de;
 /// ### Schemas
 /// A collection of schema entries, each encoded as follows:
 /// - **Entity Type**: `u16` (2 bytes, value = 0)
-/// - **Schema ID**: `u64` (8 bytes, unique identifier)
-/// - **MD5 Hash**: `[u8; 16]` (16 bytes, MD5 checksum of schema bytes)
+/// - **Schema ID**: `u64` (8 bytes, sequential identifier: 1, 2, 3, ...)
 /// - **Schema Length**: `u32` (4 bytes)
 /// - **Schema Bytes**: `Vec<u8>` (variable length, schema serialized as bytes)
 /// - **Terminator**: `u64` (8 bytes, constant `TERMINATOR`)
@@ -122,16 +130,75 @@ const TERMINATOR: u64 = 0xdeadc0dedeadc0de;
 ///   - **Row Bytes**: `Vec<u8>` (variable length, row serialized as bytes)
 /// - **Terminator**: `u64` (8 bytes, constant `TERMINATOR`)
 ///
-#[allow(dead_code)]
 pub(crate) struct CentralBlob {
     pub version: u32,
     pub format: u32,
     pub metadata: String, // UTF-8, will be stored as UTF-16LE
     pub schemas: Vec<CentralSchemaEntry>,
     pub events: Vec<CentralEventEntry>,
+    next_schema_id: u64, // Track next available schema ID
 }
 
 impl CentralBlob {
+    /// Create new empty CentralBlob
+    pub fn new(version: u32, format: u32, metadata: String) -> Self {
+        Self {
+            version,
+            format,
+            metadata,
+            schemas: Vec::new(),
+            events: Vec::new(),
+            next_schema_id: 1,
+        }
+    }
+
+    /// Add schema to payload using linear deduplication, returns schema ID
+    /// Uses collision-safe byte comparison for deduplication
+    pub fn add_schema(&mut self, schema: BondEncodedSchema) -> u64 {
+        let schema_bytes = schema.as_bytes();
+
+        // Linear scan through existing schemas - collision-safe
+        for existing_entry in &self.schemas {
+            if existing_entry.matches_schema(schema_bytes) {
+                return existing_entry.id; // Found existing schema
+            }
+        }
+
+        // New schema - assign sequential ID
+        let schema_id = self.next_schema_id;
+        self.next_schema_id += 1;
+
+        let entry = CentralSchemaEntry::new(schema_id, schema);
+        self.schemas.push(entry);
+
+        schema_id
+    }
+
+    /// Add event that references a schema ID
+    pub fn add_event(&mut self, schema_id: u64, level: u8, event_name: String, row: Vec<u8>) {
+        let event = CentralEventEntry {
+            schema_id,
+            level,
+            event_name: Arc::new(event_name),
+            row,
+        };
+        self.events.push(event);
+    }
+
+    /// Get schema by ID
+    #[allow(dead_code)]
+    pub fn get_schema(&self, schema_id: u64) -> Option<&BondEncodedSchema> {
+        self.schemas
+            .iter()
+            .find(|entry| entry.id == schema_id)
+            .map(|entry| &entry.schema)
+    }
+
+    /// Get all schema IDs present in this payload
+    pub fn get_schema_ids(&self) -> Vec<u64> {
+        self.schemas.iter().map(|s| s.id).collect()
+    }
+
     #[allow(dead_code)]
     pub(crate) fn to_bytes(&self) -> Vec<u8> {
         // Estimate buffer size:
@@ -140,7 +207,6 @@ impl CentralBlob {
         // - Each schema:
         //     2 (entity type, u16)
         //   + 8 (schema id, u64)
-        //   + 16 (md5, [u8;16])
         //   + 4 (schema bytes length, u32)
         //   + schema_bytes.len()
         //   + 8 (terminator, u64)
@@ -167,7 +233,7 @@ impl CentralBlob {
         estimated_size += self
             .schemas
             .iter()
-            .map(|s| 2 + 8 + 16 + 4 + s.schema.as_bytes().len() + 8)
+            .map(|s| 2 + 8 + 4 + s.schema.as_bytes().len() + 8) // Removed MD5 hash (16 bytes)
             .sum::<usize>();
         estimated_size += events_with_utf16
             .iter()
@@ -189,11 +255,11 @@ impl CentralBlob {
         buf.extend_from_slice(&(meta_utf16.len() as u32).to_le_bytes());
         buf.extend_from_slice(&meta_utf16);
 
-        // SCHEMAS (type 0)
+        // SCHEMAS (type 0) - NO MD5 hash, collision-safe approach
         for schema in &self.schemas {
             buf.extend_from_slice(&0u16.to_le_bytes()); // entity type 0
-            buf.extend_from_slice(&schema.id.to_le_bytes());
-            buf.extend_from_slice(&schema.md5);
+            buf.extend_from_slice(&schema.id.to_le_bytes()); // sequential schema ID
+                                                             // MD5 hash removed - no collision risk
             let schema_bytes = schema.schema.as_bytes();
             buf.extend_from_slice(&(schema_bytes.len() as u32).to_le_bytes()); //TODO - check for overflow
             buf.extend_from_slice(schema_bytes);
@@ -203,7 +269,7 @@ impl CentralBlob {
         // EVENTS (type 2)
         for (event, evname_utf16) in events_with_utf16 {
             buf.extend_from_slice(&2u16.to_le_bytes()); // entity type 2
-            buf.extend_from_slice(&event.schema_id.to_le_bytes());
+            buf.extend_from_slice(&event.schema_id.to_le_bytes()); // reference to schema ID
             buf.push(event.level);
 
             // event name (UTF-16LE, prefixed with u16 len in bytes)
@@ -230,13 +296,16 @@ mod tests {
     use crate::payload_encoder::bond_encoder::{BondEncodedSchema, FieldDef};
     use std::borrow::Cow;
 
-    //Helper to calculate MD5 hash, returns [u8;16]
-    fn md5_bytes(data: &[u8]) -> [u8; 16] {
-        md5::compute(data).0
-    }
-
     #[test]
     fn test_central_blob_creation() {
+        // Create blob
+        let mut blob = CentralBlob::new(
+            1,
+            42,
+            "namespace=testNamespace/eventVersion=Ver1v0/tenant=T/role=R/roleinstance=RI"
+                .to_string(),
+        );
+
         // Prepare a schema
         let fields = vec![
             FieldDef {
@@ -250,16 +319,16 @@ mod tests {
                 field_id: 2u16,
             },
         ];
-        let schema_obj = BondEncodedSchema::from_fields("TestStruct", "test.namespace", fields);
-        let schema_bytes = schema_obj.as_bytes().to_vec();
-        let schema_md5 = md5_bytes(&schema_bytes);
-        let schema_id = 1234u64;
+        let schema = BondEncodedSchema::from_fields("TestStruct", "test.namespace", fields);
 
-        let schema = CentralSchemaEntry {
-            id: schema_id,
-            md5: schema_md5,
-            schema: schema_obj,
-        };
+        // Add schema - collision-safe linear approach
+        let schema_id = blob.add_schema(schema.clone());
+        assert_eq!(schema_id, 1); // First schema gets ID 1
+
+        // Test deduplication - same schema should get same ID
+        let duplicate_schema_id = blob.add_schema(schema);
+        assert_eq!(duplicate_schema_id, schema_id); // Same ID returned
+        assert_eq!(blob.schemas.len(), 1); // Only stored once
 
         // Prepare a row
         let mut row = Vec::new();
@@ -268,29 +337,61 @@ mod tests {
         row.extend_from_slice(&(s.len() as u32).to_le_bytes());
         row.extend_from_slice(s.as_bytes());
 
-        let event = CentralEventEntry {
-            schema_id,
-            level: 0, // e.g. ETW verbose
-            event_name: Arc::new("eventname".to_string()),
-            row,
-        };
-
-        // Metadata
-        let metadata =
-            "namespace=testNamespace/eventVersion=Ver1v0/tenant=T/role=R/roleinstance=RI";
-
-        // Build blob
-        let blob = CentralBlob {
-            version: 1,
-            format: 42,
-            metadata: metadata.to_string(),
-            schemas: vec![schema],
-            events: vec![event],
-        };
+        // Add event
+        blob.add_event(schema_id, 0, "eventname".to_string(), row);
 
         let payload = blob.to_bytes();
 
         // Only assert that the payload is created and non-empty
         assert!(!payload.is_empty());
+
+        // Verify schema IDs
+        let schema_ids = blob.get_schema_ids();
+        assert_eq!(schema_ids, vec![1]);
+    }
+
+    #[test]
+    fn test_multiple_schemas() {
+        let mut blob = CentralBlob::new(1, 2, "test_metadata".to_string());
+
+        // Create different schemas
+        let schema1 = BondEncodedSchema::from_fields(
+            "Schema1",
+            "ns",
+            vec![FieldDef {
+                name: Cow::Borrowed("field1"),
+                type_id: crate::payload_encoder::bond_encoder::BondDataType::BT_STRING,
+                field_id: 1,
+            }],
+        );
+
+        let schema2 = BondEncodedSchema::from_fields(
+            "Schema2",
+            "ns",
+            vec![FieldDef {
+                name: Cow::Borrowed("field2"),
+                type_id: crate::payload_encoder::bond_encoder::BondDataType::BT_INT32,
+                field_id: 1,
+            }],
+        );
+
+        // Add schemas - should get sequential IDs
+        let id1 = blob.add_schema(schema1);
+        let id2 = blob.add_schema(schema2);
+
+        assert_eq!(id1, 1);
+        assert_eq!(id2, 2);
+        assert_eq!(blob.schemas.len(), 2);
+
+        // Add events using different schemas
+        blob.add_event(id1, 1, "log_event".to_string(), b"log_data".to_vec());
+        blob.add_event(id2, 2, "metric_event".to_string(), b"metric_data".to_vec());
+        blob.add_event(id1, 1, "another_log".to_string(), b"more_log_data".to_vec());
+
+        assert_eq!(blob.events.len(), 3);
+
+        // Verify schema IDs in payload
+        let schema_ids = blob.get_schema_ids();
+        assert_eq!(schema_ids, vec![1, 2]);
     }
 }
