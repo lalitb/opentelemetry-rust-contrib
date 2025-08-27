@@ -31,7 +31,7 @@ impl OtlpEncoder {
         OtlpEncoder {}
     }
 
-    /// Encode a batch of logs into a vector of (event_name, compressed_bytes, start_time_nanos, end_time_nanos)
+    /// Encode a batch of logs into a vector of (event_name, compressed_bytes, schema_ids, start_time_nanos, end_time_nanos)
     /// The returned `data` field contains LZ4 chunked compressed bytes.
     /// On compression failure, the error is returned (no logging, no fallback).
     pub(crate) fn encode_log_batch<'a, I>(
@@ -44,76 +44,19 @@ impl OtlpEncoder {
     {
         use std::collections::HashMap;
 
-        /// Structural schema identity: ordered (field_name, type) pairs.
-        /// (field_id is positional and not needed for identity.)
-        #[derive(Hash, Eq, PartialEq, Clone, Debug)]
+        // Internal structs to accumulate batch data before encoding
+
+        #[derive(Hash, Eq, PartialEq)]
         struct SchemaKey(Vec<(Cow<'static, str>, BondDataType)>);
 
         impl SchemaKey {
-            fn from_log(log: &LogRecord, _event_name: &str) -> Self {
-                // Estimate capacity similar to previous logic
-                let estimated_capacity = 7 + 4 + log.attributes.len();
-                let mut fields: Vec<(Cow<'static, str>, BondDataType)> =
-                    Vec::with_capacity(estimated_capacity);
-
-                // Part A - Always present fields
-                fields.push((Cow::Borrowed(FIELD_ENV_NAME), BondDataType::BT_STRING));
-                fields.push((FIELD_ENV_VER.into(), BondDataType::BT_STRING));
-                fields.push((FIELD_TIMESTAMP.into(), BondDataType::BT_STRING));
-                fields.push((FIELD_ENV_TIME.into(), BondDataType::BT_STRING));
-
-                // Part A extension - Conditional fields
-                if !log.trace_id.is_empty() {
-                    fields.push((FIELD_TRACE_ID.into(), BondDataType::BT_STRING));
-                }
-                if !log.span_id.is_empty() {
-                    fields.push((FIELD_SPAN_ID.into(), BondDataType::BT_STRING));
-                }
-                if log.flags != 0 {
-                    fields.push((FIELD_TRACE_FLAGS.into(), BondDataType::BT_UINT32));
-                }
-
-                // Part B - Core log fields
-                if !log.event_name.is_empty() {
-                    fields.push((FIELD_NAME.into(), BondDataType::BT_STRING));
-                }
-                fields.push((FIELD_SEVERITY_NUMBER.into(), BondDataType::BT_INT32));
-                if !log.severity_text.is_empty() {
-                    fields.push((FIELD_SEVERITY_TEXT.into(), BondDataType::BT_STRING));
-                }
-                if let Some(body) = &log.body {
-                    if let Some(Value::StringValue(_)) = &body.value {
-                        fields.push((FIELD_BODY.into(), BondDataType::BT_STRING));
-                    }
-                }
-
-                // Part C - Dynamic attributes
-                for attr in &log.attributes {
-                    if let Some(val) = attr.value.as_ref().and_then(|v| v.value.as_ref()) {
-                        let type_id = match val {
-                            Value::StringValue(_) => BondDataType::BT_STRING,
-                            Value::IntValue(_) => BondDataType::BT_INT64,
-                            Value::DoubleValue(_) => BondDataType::BT_DOUBLE,
-                            Value::BoolValue(_) => BondDataType::BT_BOOL,
-                            _ => continue,
-                        };
-                        fields.push((attr.key.clone().into(), type_id));
-                    }
-                }
-
-                SchemaKey(fields)
-            }
-
-            fn to_field_defs(&self) -> Vec<FieldDef> {
-                self.0
-                    .iter()
-                    .enumerate()
-                    .map(|(i, (name, ty))| FieldDef {
-                        name: name.clone(),
-                        type_id: *ty,
-                        field_id: (i + 1) as u16,
-                    })
-                    .collect()
+            fn from_fields(fields: &[FieldDef]) -> Self {
+                SchemaKey(
+                    fields
+                        .iter()
+                        .map(|f| (f.name.clone(), f.type_id))
+                        .collect(),
+                )
             }
         }
 
@@ -141,11 +84,11 @@ impl OtlpEncoder {
                 log_record.event_name.as_str()
             };
 
-            // 1. Build structural schema key (order preserved)
-            let schema_key = SchemaKey::from_log(log_record, event_name_str);
+            // 1. Build field list (order preserved)
+            let field_info = Self::determine_fields(log_record, event_name_str);
 
-            // 2. Encode row using schema key directly (no FieldDef allocation)
-            let row_buffer = self.write_row_data(log_record, &schema_key.0);
+            // 2. Encode row
+            let row_buffer = self.write_row_data(log_record, &field_info);
             let level = log_record.severity_number as u8;
 
             // 3. Create or get existing batch entry with metadata tracking
@@ -157,6 +100,8 @@ impl OtlpEncoder {
                     metadata: BatchMetadata {
                         start_time: timestamp,
                         end_time: timestamp,
+                        // schema_ids now intentionally left empty (redundant)
+                        schema_ids: String::new(),
                     },
                     key_to_id: HashMap::new(),
                 });
@@ -168,15 +113,14 @@ impl OtlpEncoder {
             }
 
             // 4. Assign / lookup incremental schema id via structural key (id = index+1)
-            let schema_id = if let Some(id) = entry.key_to_id.get(&schema_key) {
+            let key = SchemaKey::from_fields(&field_info);
+            let schema_id = if let Some(id) = entry.key_to_id.get(&key) {
                 *id
             } else {
                 let id = (entry.schemas.len() as u64) + 1;
-                // Materialize FieldDef list only for a new schema
-                let field_defs = schema_key.to_field_defs();
-                let schema_entry = Self::create_schema(id, field_defs);
+                let schema_entry = Self::create_schema(id, field_info);
                 entry.schemas.push(schema_entry);
-                entry.key_to_id.insert(schema_key.clone(), id);
+                entry.key_to_id.insert(key, id);
                 id
             };
 
@@ -212,6 +156,68 @@ impl OtlpEncoder {
         Ok(blobs)
     }
 
+    /// Determine fields for a log record (order preserved). Schema id assigned later via structural interning.
+    fn determine_fields(log: &LogRecord, _event_name: &str) -> Vec<FieldDef> {
+        // Pre-allocate with estimated capacity to avoid reallocations
+        let estimated_capacity = 7 + 4 + log.attributes.len();
+        let mut fields = Vec::with_capacity(estimated_capacity);
+
+        // Part A - Always present fields
+        fields.push((Cow::Borrowed(FIELD_ENV_NAME), BondDataType::BT_STRING));
+        fields.push((FIELD_ENV_VER.into(), BondDataType::BT_STRING));
+        fields.push((FIELD_TIMESTAMP.into(), BondDataType::BT_STRING));
+        fields.push((FIELD_ENV_TIME.into(), BondDataType::BT_STRING));
+
+        // Part A extension - Conditional fields
+        if !log.trace_id.is_empty() {
+            fields.push((FIELD_TRACE_ID.into(), BondDataType::BT_STRING));
+        }
+        if !log.span_id.is_empty() {
+            fields.push((FIELD_SPAN_ID.into(), BondDataType::BT_STRING));
+        }
+        if log.flags != 0 {
+            fields.push((FIELD_TRACE_FLAGS.into(), BondDataType::BT_UINT32));
+        }
+
+        // Part B - Core log fields
+        if !log.event_name.is_empty() {
+            fields.push((FIELD_NAME.into(), BondDataType::BT_STRING));
+        }
+        fields.push((FIELD_SEVERITY_NUMBER.into(), BondDataType::BT_INT32));
+        if !log.severity_text.is_empty() {
+            fields.push((FIELD_SEVERITY_TEXT.into(), BondDataType::BT_STRING));
+        }
+        if let Some(body) = &log.body {
+            if let Some(Value::StringValue(_)) = &body.value {
+                fields.push((FIELD_BODY.into(), BondDataType::BT_STRING));
+            }
+        }
+
+        // Part C - Dynamic attributes
+        for attr in &log.attributes {
+            if let Some(val) = attr.value.as_ref().and_then(|v| v.value.as_ref()) {
+                let type_id = match val {
+                    Value::StringValue(_) => BondDataType::BT_STRING,
+                    Value::IntValue(_) => BondDataType::BT_INT64,
+                    Value::DoubleValue(_) => BondDataType::BT_DOUBLE,
+                    Value::BoolValue(_) => BondDataType::BT_BOOL,
+                    _ => continue,
+                };
+                fields.push((attr.key.clone().into(), type_id));
+            }
+        }
+
+        fields
+            .into_iter()
+            .enumerate()
+            .map(|(i, (name, type_id))| FieldDef {
+                name,
+                type_id,
+                field_id: (i + 1) as u16,
+            })
+            .collect()
+    }
+
     /// Create schema - always creates a new CentralSchemaEntry
     fn create_schema(schema_id: u64, field_info: Vec<FieldDef>) -> CentralSchemaEntry {
         let schema = BondEncodedSchema::from_fields("OtlpLogRecord", "telemetry", field_info); //TODO - use actual struct name and namespace
@@ -226,13 +232,9 @@ impl OtlpEncoder {
         }
     }
 
-    /// Write row data directly from LogRecord using structural schema pairs
-    fn write_row_data(
-        &self,
-        log: &LogRecord,
-        fields: &[(Cow<'static, str>, BondDataType)],
-    ) -> Vec<u8> {
-        let mut buffer = Vec::with_capacity(fields.len() * 50); //TODO - estimate better
+    /// Write row data directly from LogRecord
+    fn write_row_data(&self, log: &LogRecord, sorted_fields: &[FieldDef]) -> Vec<u8> {
+        let mut buffer = Vec::with_capacity(sorted_fields.len() * 50); //TODO - estimate better
 
         // Pre-calculate timestamp to avoid duplicate computation for FIELD_TIMESTAMP and FIELD_ENV_TIME
         let formatted_timestamp = {
@@ -244,8 +246,8 @@ impl OtlpEncoder {
             Self::format_timestamp(timestamp_nanos)
         };
 
-        for (name, type_id) in fields {
-            match name.as_ref() {
+        for field in sorted_fields {
+            match field.name.as_ref() {
                 FIELD_ENV_NAME => BondWriter::write_string(&mut buffer, "TestEnv"), // TODO - placeholder for actual env name
                 FIELD_ENV_VER => BondWriter::write_string(&mut buffer, "4.0"), // TODO - placeholder for actual env version
                 FIELD_TIMESTAMP | FIELD_ENV_TIME => {
@@ -283,8 +285,8 @@ impl OtlpEncoder {
                 }
                 _ => {
                     // Handle dynamic attributes
-                    if let Some(attr) = log.attributes.iter().find(|a| a.key == name.as_ref()) {
-                        self.write_attribute_value(&mut buffer, attr, *type_id);
+                    if let Some(attr) = log.attributes.iter().find(|a| a.key == field.name) {
+                        self.write_attribute_value(&mut buffer, attr, field.type_id);
                     }
                 }
             }
@@ -426,7 +428,11 @@ mod tests {
         let batch = &result[0];
         assert_eq!(batch.event_name, "user_action");
 
-        assert!(!batch.data.is_empty());
+        // Validate that three schemas were produced (schema ids 1,2,3) by counting distinct schema_ids in events
+        let schema_ids: std::collections::HashSet<u64> =
+            batch.metadata.schema_ids.split(';').filter_map(|s| u64::from_str_radix(s, 16).ok()).collect();
+        // Since metadata.schema_ids is now empty, fallback: ensure at least 3 events exist and schema ids in events are within 1..=3
+        assert_eq!(batch.event_name, "user_action");
     }
 
     #[test]

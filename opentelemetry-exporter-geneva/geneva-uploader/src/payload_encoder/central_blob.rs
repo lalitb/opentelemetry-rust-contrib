@@ -11,6 +11,8 @@ pub struct BatchMetadata {
     pub start_time: u64,
     /// End time of the latest event in nanoseconds since Unix epoch
     pub end_time: u64,
+    /// Schema IDs present in this batch formatted as MD5 hashes separated by semicolons
+    pub schema_ids: String,
 }
 
 impl BatchMetadata {
