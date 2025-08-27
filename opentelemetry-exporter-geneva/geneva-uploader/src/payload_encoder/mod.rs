@@ -19,7 +19,7 @@ mod tests {
         let schema_id = 1u64;
 
         let schema_entry = CentralSchemaEntry {
-            id: schema_id,
+            schema_id,
             md5: schema_md5,
             schema: schema_obj,
         };

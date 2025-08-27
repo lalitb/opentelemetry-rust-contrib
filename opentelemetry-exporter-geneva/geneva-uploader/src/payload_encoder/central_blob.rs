@@ -69,7 +69,7 @@ fn utf8_to_utf16le_bytes(s: &str) -> Vec<u8> {
 /// Schema entry for central blob
 #[allow(dead_code)]
 pub(crate) struct CentralSchemaEntry {
-    pub id: u64,
+    pub schema_id: u64,
     pub md5: [u8; 16],
     pub schema: BondEncodedSchema,
 }
@@ -192,7 +192,7 @@ impl CentralBlob {
         // SCHEMAS (type 0)
         for schema in &self.schemas {
             buf.extend_from_slice(&0u16.to_le_bytes()); // entity type 0
-            buf.extend_from_slice(&schema.id.to_le_bytes());
+            buf.extend_from_slice(&schema.schema_id.to_le_bytes());
             buf.extend_from_slice(&schema.md5);
             let schema_bytes = schema.schema.as_bytes();
             buf.extend_from_slice(&(schema_bytes.len() as u32).to_le_bytes()); //TODO - check for overflow
@@ -256,7 +256,7 @@ mod tests {
         let schema_id = 1234u64;
 
         let schema = CentralSchemaEntry {
-            id: schema_id,
+            schema_id,
             md5: schema_md5,
             schema: schema_obj,
         };

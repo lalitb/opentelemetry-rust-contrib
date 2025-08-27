@@ -70,7 +70,7 @@ impl OtlpEncoder {
                         if i > 0 {
                             acc.push(';');
                         }
-                        let md5_hash = md5::compute(s.id.to_le_bytes());
+                        let md5_hash = md5::compute(s.schema_id.to_le_bytes());
                         write!(&mut acc, "{md5_hash:x}").unwrap();
                         acc
                     },
@@ -123,7 +123,7 @@ impl OtlpEncoder {
             }
 
             // 4. Add schema entry if not already present (multiple schemas per event_name batch)
-            if !entry.schemas.iter().any(|s| s.id == schema_id) {
+            if !entry.schemas.iter().any(|s| s.schema_id == schema_id) {
                 let schema_entry = Self::create_schema(schema_id, field_info);
                 entry.schemas.push(schema_entry);
             }
@@ -253,7 +253,7 @@ impl OtlpEncoder {
         let schema_md5 = md5::compute(schema_bytes).0;
 
         CentralSchemaEntry {
-            id: schema_id,
+            schema_id,
             md5: schema_md5,
             schema,
         }
