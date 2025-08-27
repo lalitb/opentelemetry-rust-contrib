@@ -157,8 +157,7 @@ impl GenevaUploader {
         event_name: &str,
         metadata: &BatchMetadata,
     ) -> Result<String> {
-        // Get already formatted schema IDs and format timestamps using BatchMetadata methods
-        let schema_ids = &metadata.schema_ids;
+        // Format timestamps using BatchMetadata methods
         let start_time_str = metadata.format_start_timestamp();
         let end_time_str = metadata.format_end_timestamp();
 
@@ -174,7 +173,7 @@ impl GenevaUploader {
 
         // Create the query string
         let mut query = String::with_capacity(512); // Preallocate enough space for the query string (decided based on expected size)
-        write!(&mut query, "api/v1/ingestion/ingest?endpoint={}&moniker={}&namespace={}&event={}&version={}&sourceUniqueId={}&sourceIdentity={}&startTime={}&endTime={}&format=centralbond/lz4hc&dataSize={}&minLevel={}&schemaIds={}",
+        write!(&mut query, "api/v1/ingestion/ingest?endpoint={}&moniker={}&namespace={}&event={}&version={}&sourceUniqueId={}&sourceIdentity={}&startTime={}&endTime={}&format=centralbond/lz4hc&dataSize={}&minLevel={}",
             encoded_monitoring_endpoint,
             moniker,
             self.config.namespace,
@@ -185,8 +184,7 @@ impl GenevaUploader {
             start_time_str,
             end_time_str,
             data_size,
-            2,
-            schema_ids
+            2
         ).map_err(|e| GenevaUploaderError::InternalError(format!("Failed to write query string: {e}")))?;
         Ok(query)
     }
