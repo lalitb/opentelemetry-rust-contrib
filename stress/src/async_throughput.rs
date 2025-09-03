@@ -45,6 +45,10 @@ pub struct ThroughputConfig {
     pub target_ops: Option<usize>,
     /// Whether to use task spawning (for multi-thread runtime)
     pub use_spawn: bool,
+    /// Optional shutdown callback - called when continuous test is interrupted
+    pub shutdown_callback: Option<Box<dyn FnOnce() + Send + 'static>>,
+    /// Optional callback to get ongoing requests count
+    pub ongoing_requests_callback: Option<Box<dyn Fn() -> usize + Send + Sync + 'static>>,
 }
 
 impl Default for ThroughputConfig {
@@ -54,6 +58,8 @@ impl Default for ThroughputConfig {
             report_interval: Duration::from_secs(5),
             target_ops: None,
             use_spawn: true,
+            shutdown_callback: None,
+            ongoing_requests_callback: None,
         }
     }
 }
@@ -65,7 +71,7 @@ impl ThroughputTest {
     /// Run a continuous throughput test (until interrupted)
     pub async fn run_continuous<F, Fut, T, E>(
         name: &str,
-        config: ThroughputConfig,
+        mut config: ThroughputConfig,
         operation_factory: F,
     ) where
         F: Fn() -> Fut + Send + 'static,
@@ -81,11 +87,33 @@ impl ThroughputTest {
         let completed_ops = Arc::new(AtomicU64::new(0));
         let successful_ops = Arc::new(AtomicU64::new(0));
 
+        // Set up Ctrl+C handler
+        let shutdown_callback = config.shutdown_callback.take();
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+        tokio::spawn(async move {
+            match tokio::signal::ctrl_c().await {
+                Ok(()) => {
+                    println!("\nReceived Ctrl+C signal...");
+                    // Call the shutdown callback if provided
+                    if let Some(callback) = shutdown_callback {
+                        callback();
+                    }
+                    let _ = shutdown_tx.send(());
+                }
+                Err(err) => {
+                    eprintln!("Unable to listen for shutdown signal: {}", err);
+                    let _ = shutdown_tx.send(());
+                }
+            }
+        });
+
         // Clone for reporting thread
         let completed_clone = Arc::clone(&completed_ops);
         let successful_clone = Arc::clone(&successful_ops);
         let start_time = Instant::now();
         let report_interval = config.report_interval;
+        let ongoing_requests_fn = config.ongoing_requests_callback;
 
         // Spawn reporting thread
         let _reporting_handle = std::thread::spawn(move || {
@@ -106,14 +134,16 @@ impl ThroughputTest {
                 } else {
                     0.0
                 };
+                let ongoing_requests = ongoing_requests_fn.as_ref().map(|f| f()).unwrap_or(0);
 
                 println!(
-                    "Progress: {} ops completed ({} successful, {:.1}%) in {:.2}s = {:.2} ops/sec",
+            "Progress: {} ops completed ({} successful, {:.1}%) in {:.2}s = {:.2} ops/sec | Ongoing: {}",
                     ops,
                     success,
                     success_percentage,
                     elapsed.as_secs_f64(),
-                    throughput
+                    throughput,
+                    ongoing_requests
                 );
                 #[cfg(feature = "stats")]
                 {
@@ -140,17 +170,25 @@ impl ThroughputTest {
                 .buffer_unordered(config.concurrency);
 
             // Process stream until interrupted
-            while let Some(result) = operation_stream.next().await {
-                completed_ops.fetch_add(1, Ordering::Relaxed);
-                match result {
-                    Ok(Ok(_)) => {
-                        successful_ops.fetch_add(1, Ordering::Relaxed);
+            loop {
+                tokio::select! {
+                    Some(result) = operation_stream.next() => {
+                        completed_ops.fetch_add(1, Ordering::Relaxed);
+                        match result {
+                            Ok(Ok(_)) => {
+                                successful_ops.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Ok(Err(e)) => {
+                                eprintln!("Operation failed: {e}");
+                            }
+                            Err(e) => {
+                                eprintln!("Task join error: {e}");
+                            }
+                        }
                     }
-                    Ok(Err(e)) => {
-                        eprintln!("Operation failed: {e}");
-                    }
-                    Err(e) => {
-                        eprintln!("Task join error: {e}");
+                    _ = &mut shutdown_rx => {
+                        println!("Shutting down gracefully...");
+                        break;
                     }
                 }
             }
@@ -161,14 +199,22 @@ impl ThroughputTest {
                 .buffer_unordered(config.concurrency);
 
             // Process stream until interrupted
-            while let Some(result) = operation_stream.next().await {
-                completed_ops.fetch_add(1, Ordering::Relaxed);
-                match result {
-                    Ok(_) => {
-                        successful_ops.fetch_add(1, Ordering::Relaxed);
+            loop {
+                tokio::select! {
+                        Some(result) = operation_stream.next() => {
+                            completed_ops.fetch_add(1, Ordering::Relaxed);
+                            match result {
+                                Ok(_) => {
+                                successful_ops.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(e) => {
+                                eprintln!("Operation failed: {e}");
+                            }
+                        }
                     }
-                    Err(e) => {
-                        eprintln!("Operation failed: {e}");
+                    _ = &mut shutdown_rx => {
+                        println!("Shutting down gracefully...");
+                        break;
                     }
                 }
             }
