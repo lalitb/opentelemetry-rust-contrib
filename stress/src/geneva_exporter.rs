@@ -51,11 +51,19 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 fn create_test_logs() -> Vec<ResourceLogs> {
     let mut log_records = Vec::new();
 
-    // Create 10 simple log records
-    for i in 0..10 {
+    // Get current timestamp once to avoid repeated syscalls
+    let base_timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+
+    // Create 1000 simple log records
+    for i in 0..1000 {
+        let timestamp = base_timestamp + (i * 1_000_000); // Add 1ms per log
         let log = LogRecord {
-            observed_time_unix_nano: 1700000000000000000 + i,
-            event_name: "StressTestEvent".to_string(),
+            time_unix_nano: timestamp,
+            observed_time_unix_nano: timestamp,
+            event_name: "Log".to_string(),
             severity_number: 9,
             severity_text: "INFO".to_string(),
             body: Some(AnyValue {
@@ -65,7 +73,7 @@ fn create_test_logs() -> Vec<ResourceLogs> {
                 KeyValue {
                     key: "test_id".to_string(),
                     value: Some(AnyValue {
-                        value: Some(Value::StringValue("stress".to_string())),
+                        value: Some(Value::StringValue("stress1".to_string())),
                     }),
                 },
                 KeyValue {
@@ -96,6 +104,41 @@ fn generate_mock_jwt_and_expiry(_endpoint: &str, _ttl_secs: i64) -> (String, Str
     let expiry = "2026-06-30T12:00:00+00:00";
 
     (token.to_string(), expiry.to_string())
+}
+
+// Helper function to parse Geneva uploader error for detailed logging
+fn log_geneva_error(error: &str) {
+    // Determine category from error string - now with better structured error messages
+    let category = if error.contains("Service unavailable (503)") {
+        "service_unavailable"
+    } else if error.contains("Rate limited (429)") {
+        "rate_limited"
+    } else if error.contains("Client error") {
+        "client_error"
+    } else if error.contains("Server error") {
+        "server_error"
+    } else if error.contains("Network error") {
+        "network_error"
+    } else {
+        "other_error"
+    };
+
+    eprintln!("[{}] Upload failed: {}", category, error);
+}
+
+// Simple upload function without retries for load testing
+async fn upload_batch_simple(
+    client: &GenevaClient,
+    batch: &geneva_uploader::EncodedBatch,
+) -> Result<(), String> {
+    match client.upload_batch(batch).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // Log structured error with detailed categorization
+            log_geneva_error(&e);
+            Err(e)
+        }
+    }
 }
 
 async fn init_client() -> Result<(GenevaClient, Option<String>), Box<dyn std::error::Error>> {
@@ -273,8 +316,7 @@ async fn async_main(
         .encode_and_compress_logs(&logs)
         .map_err(|e| format!("Failed to encode logs: {e}"))?;
     for batch in &warm_batches {
-        client
-            .upload_batch(batch)
+        upload_batch_simple(&client, batch)
             .await
             .map_err(|e| format!("Failed to upload batch: {e}"))?;
     }
@@ -300,8 +342,7 @@ async fn async_main(
 
                     // Upload batches sequentially TODO - use buffer_unordered for concurrency
                     for batch in &batches {
-                        client
-                            .upload_batch(batch)
+                        upload_batch_simple(&client, batch)
                             .await
                             .map_err(|e| format!("Failed to upload batch: {e}"))?;
                     }
@@ -334,8 +375,7 @@ async fn async_main(
 
                     // Upload batches sequentially - TODO - use buffer_unordered for concurrency
                     for batch in &batches {
-                        client
-                            .upload_batch(batch)
+                        upload_batch_simple(&client, batch)
                             .await
                             .map_err(|e| format!("Failed to upload batch: {e}"))?;
                     }
@@ -364,7 +404,7 @@ async fn async_main(
                             Err(e) => return Err(format!("Failed to encode logs: {e}")),
                         };
                         for batch in &batches {
-                            if let Err(e) = client.upload_batch(batch).await {
+                            if let Err(e) = upload_batch_simple(&client, batch).await {
                                 return Err(format!("Failed to upload batch: {e}"));
                             }
                         }

@@ -4,27 +4,60 @@ use reqwest::{header, Client};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::error::Error as StdError;
 use std::fmt::Write;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use thiserror::Error;
 use url::form_urlencoded::byte_serialize;
 use uuid::Uuid;
 
 /// Error types for the Geneva Uploader
 #[derive(Debug, Error)]
-pub(crate) enum GenevaUploaderError {
-    #[error("HTTP error: {0}")]
-    Http(String),
+pub enum GenevaUploaderError {
+    #[error("Service unavailable (503): {message}")]
+    ServiceUnavailable {
+        message: String,
+        retry_after: Option<Duration>,
+        headers: Option<HashMap<String, String>>,
+    },
+
+    #[error("Rate limited (429): {message}")]
+    RateLimited {
+        message: String,
+        retry_after: Option<Duration>,
+        rate_limit_reset: Option<SystemTime>,
+        headers: Option<HashMap<String, String>>,
+    },
+
+    #[error("Client error ({status}): {message}")]
+    ClientError {
+        status: u16,
+        message: String,
+        headers: Option<HashMap<String, String>>,
+    },
+
+    #[error("Server error ({status}): {message}")]
+    ServerError {
+        status: u16,
+        message: String,
+        retry_after: Option<Duration>,
+        headers: Option<HashMap<String, String>>,
+    },
+
+    #[error("Network error: {source}")]
+    NetworkError {
+        #[source]
+        source: reqwest::Error,
+        url: String,
+        error_kind: String,
+    },
+
     #[error("JSON error: {0}")]
     SerdeJson(#[from] serde_json::Error),
+
     #[error("Config service error: {0}")]
     ConfigClient(String),
-    #[allow(dead_code)]
-    #[error("Upload failed with status {status}: {message}")]
-    UploadFailed { status: u16, message: String },
-    #[allow(dead_code)]
+
     #[error("Internal error: {0}")]
     InternalError(String),
 }
@@ -38,52 +71,119 @@ impl From<GenevaConfigClientError> for GenevaUploaderError {
 
 impl From<reqwest::Error> for GenevaUploaderError {
     fn from(err: reqwest::Error) -> Self {
-        use std::fmt::Write;
-        let mut msg = String::new();
-        write!(&mut msg, "{err}").ok();
+        let url = err.url().map(|u| u.to_string()).unwrap_or_else(|| "unknown".to_string());
 
-        if let Some(url) = err.url() {
-            write!(msg, ", url: {url}").ok();
-        }
-        if let Some(status) = err.status() {
-            write!(msg, ", status: {status}").ok();
-        }
-
-        // Print high-level error types
-        if err.is_timeout() {
-            write!(&mut msg, ", kind: timeout").ok();
+        // Determine error kind
+        let error_kind = if err.is_timeout() {
+            "timeout".to_string()
         } else if err.is_connect() {
-            write!(&mut msg, ", kind: connect").ok();
+            "connect".to_string()
         } else if err.is_body() {
-            write!(&mut msg, ", kind: body").ok();
+            "body".to_string()
         } else if err.is_decode() {
-            write!(&mut msg, ", kind: decode").ok();
+            "decode".to_string()
         } else if err.is_request() {
-            write!(&mut msg, ", kind: request").ok();
+            "request".to_string()
+        } else {
+            "unknown".to_string()
+        };
+
+        GenevaUploaderError::NetworkError {
+            source: err,
+            url,
+            error_kind,
         }
-
-        // Traverse the whole source chain for detail
-        let mut source = err.source();
-        let mut idx = 0;
-        let mut found_io = false;
-        while let Some(s) = source {
-            write!(msg, ", cause[{idx}]: {s}").ok();
-
-            // Surface io::ErrorKind if found
-            if let Some(io_err) = s.downcast_ref::<std::io::Error>() {
-                write!(msg, " (io::ErrorKind::{:?})", io_err.kind()).ok();
-                found_io = true;
-            }
-            source = s.source();
-            idx += 1;
-        }
-
-        if !found_io {
-            write!(&mut msg, ", (no io::Error in source chain)").ok();
-        }
-
-        GenevaUploaderError::Http(msg)
     }
+}
+
+impl GenevaUploaderError {
+    /// Check if this error indicates a retryable condition
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::ServiceUnavailable { .. } => true,
+            Self::RateLimited { .. } => true,
+            Self::ServerError { status, .. } => {
+                // Retry on specific 5xx errors
+                matches!(*status, 500 | 502 | 503 | 504)
+            }
+            Self::NetworkError { error_kind, .. } => {
+                // Retry on network issues (except body/decode which indicate protocol issues)
+                matches!(error_kind.as_str(), "timeout" | "connect" | "request")
+            }
+            _ => false,
+        }
+    }
+
+    /// Get the retry-after duration if available
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::ServiceUnavailable { retry_after, .. } => *retry_after,
+            Self::RateLimited { retry_after, .. } => *retry_after,
+            Self::ServerError { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
+
+    /// Get error category for metrics/logging
+    pub fn category(&self) -> &'static str {
+        match self {
+            Self::ServiceUnavailable { .. } => "service_unavailable",
+            Self::RateLimited { .. } => "rate_limited",
+            Self::ClientError { .. } => "client_error",
+            Self::ServerError { .. } => "server_error",
+            Self::NetworkError { .. } => "network_error",
+            Self::SerdeJson(_) => "json_error",
+            Self::ConfigClient(_) => "config_error",
+            Self::InternalError(_) => "internal_error",
+        }
+    }
+
+    /// Get HTTP status code if available
+    pub fn status_code(&self) -> Option<u16> {
+        match self {
+            Self::ServiceUnavailable { .. } => Some(503),
+            Self::RateLimited { .. } => Some(429),
+            Self::ClientError { status, .. } => Some(*status),
+            Self::ServerError { status, .. } => Some(*status),
+            _ => None,
+        }
+    }
+}
+
+/// Helper function to extract headers from reqwest response
+fn extract_headers(headers: &header::HeaderMap) -> HashMap<String, String> {
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value.to_str().ok().map(|v| (name.to_string(), v.to_string()))
+        })
+        .collect()
+}
+
+/// Helper function to parse Retry-After header
+fn parse_retry_after(headers: &header::HeaderMap) -> Option<Duration> {
+    headers
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| {
+            // Try parsing as seconds first
+            if let Ok(seconds) = s.parse::<u64>() {
+                Some(Duration::from_secs(seconds))
+            } else {
+                // Try parsing as HTTP date (not implemented for now)
+                None
+            }
+        })
+}
+
+/// Helper function to parse rate limit reset time
+fn parse_rate_limit_reset(headers: &header::HeaderMap) -> Option<SystemTime> {
+    headers
+        .get("x-ratelimit-reset")
+        .or_else(|| headers.get("ratelimit-reset"))
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(|timestamp| SystemTime::UNIX_EPOCH + Duration::from_secs(timestamp))
 }
 
 pub(crate) type Result<T> = std::result::Result<T, GenevaUploaderError>;
@@ -146,10 +246,12 @@ impl GenevaUploader {
 
     fn build_h1_client(headers: header::HeaderMap) -> Result<Client> {
         Ok(Client::builder()
-            .timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(60))
             .default_headers(headers)
             .http1_only()
-            .tcp_keepalive(Some(Duration::from_secs(60)))
+            .tcp_keepalive(Some(Duration::from_secs(30)))
+            .pool_max_idle_per_host(20)
+            .pool_idle_timeout(Duration::from_secs(30))
             .build()?)
     }
 
@@ -241,19 +343,49 @@ impl GenevaUploader {
             .body(data)
             .send()
             .await?;
+
         let status = response.status();
+        let headers = response.headers().clone();
+        let extracted_headers = extract_headers(&headers);
         let body = response.text().await?;
 
         if status == reqwest::StatusCode::ACCEPTED {
             let ingest_response: IngestionResponse =
                 serde_json::from_str(&body).map_err(GenevaUploaderError::SerdeJson)?;
-
             Ok(ingest_response)
         } else {
-            Err(GenevaUploaderError::UploadFailed {
-                status: status.as_u16(),
-                message: body,
-            })
+            // Create structured error based on status code
+            let status_code = status.as_u16();
+            let retry_after = parse_retry_after(&headers);
+
+            match status_code {
+                503 => Err(GenevaUploaderError::ServiceUnavailable {
+                    message: body,
+                    retry_after,
+                    headers: Some(extracted_headers),
+                }),
+                429 => Err(GenevaUploaderError::RateLimited {
+                    message: body,
+                    retry_after,
+                    rate_limit_reset: parse_rate_limit_reset(&headers),
+                    headers: Some(extracted_headers),
+                }),
+                400..=499 => Err(GenevaUploaderError::ClientError {
+                    status: status_code,
+                    message: body,
+                    headers: Some(extracted_headers),
+                }),
+                500..=599 => Err(GenevaUploaderError::ServerError {
+                    status: status_code,
+                    message: body,
+                    retry_after,
+                    headers: Some(extracted_headers),
+                }),
+                _ => Err(GenevaUploaderError::InternalError(format!(
+                    "Unexpected status code {}: {}",
+                    status_code, body
+                ))),
+            }
         }
     }
 }

@@ -14,9 +14,10 @@ pub(crate) use config_service::client::{
 
 #[allow(unused_imports)]
 pub(crate) use ingestion_service::uploader::{
-    GenevaUploader, GenevaUploaderConfig, GenevaUploaderError, Result,
+    GenevaUploader, GenevaUploaderConfig, Result,
 };
 
 pub use client::EncodedBatch;
 pub use client::{GenevaClient, GenevaClientConfig};
 pub use config_service::client::AuthMethod;
+pub use ingestion_service::uploader::GenevaUploaderError;
