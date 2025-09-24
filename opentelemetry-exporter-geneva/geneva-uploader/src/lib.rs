@@ -8,15 +8,16 @@ pub mod client;
 mod bench;
 
 #[allow(unused_imports)]
-pub(crate) use config_service::client::{
-    GenevaConfigClient, GenevaConfigClientConfig, GenevaConfigClientError, IngestionGatewayInfo,
-};
-
-#[allow(unused_imports)]
 pub(crate) use ingestion_service::uploader::{
     GenevaUploader, GenevaUploaderConfig, GenevaUploaderError, Result,
 };
 
 pub use client::EncodedBatch;
 pub use client::{GenevaClient, GenevaClientConfig};
-pub use config_service::client::AuthMethod;
+pub use config_service::{
+    azure_arc_msi::AzureArcManagedIdentityCredential,
+    client::{
+        AuthMethod, GenevaConfigClient, GenevaConfigClientConfig,
+        GenevaConfigClientError, IngestionGatewayInfo, MonikerInfo,
+    },
+};
