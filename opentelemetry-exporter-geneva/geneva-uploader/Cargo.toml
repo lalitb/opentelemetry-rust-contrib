@@ -24,6 +24,8 @@ url = "2.2"
 md5 = "0.8.0"
 hex = "0.4"
 lz4_flex = { version = "0.11", features = ["safe-encode"], default-features = false }
+azure_core = { version = "0.28", default-features = false, features = ["reqwest"] }
+async-trait = "0.1"
 
 [features]
 self_signed_certs = [] # Empty by default for security

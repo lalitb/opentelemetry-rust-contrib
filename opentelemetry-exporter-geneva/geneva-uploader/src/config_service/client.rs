@@ -18,11 +18,15 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::RwLock;
 
+use crate::config_service::azure_arc_msi::AzureArcManagedIdentityCredential;
+use azure_core::{credentials::TokenCredential, http::new_http_client};
+use std::sync::Arc;
+
 /// Authentication methods for the Geneva Config Client.
 ///
-/// The client supports two authentication methods:
+/// The client supports multiple authentication methods:
 /// - Certificate-based authentication using PKCS#12 (.p12) files
-/// - Managed Identity (Azure) - planned for future implementation
+/// - Azure Arc Managed Identity authentication (for Arc-enabled machines)
 ///
 /// # Certificate Format
 /// Certificates should be in PKCS#12 (.p12) format for client TLS authentication.
@@ -53,16 +57,17 @@ pub enum AuthMethod {
     /// * `path` - Path to the PKCS#12 (.p12) certificate file
     /// * `password` - Password to decrypt the PKCS#12 file
     Certificate { path: PathBuf, password: String },
-    /// Azure Managed Identity authentication
+    /// Azure Arc Managed Identity authentication
     ///
-    /// Note(TODO): This is not yet implemented.
-    ManagedIdentity,
+    /// Uses the two-step challenge flow required by Azure Arc MSI endpoint.
+    /// Requires access to Azure Arc agent's secret files.
+    AzureArcManagedIdentity,
     #[cfg(feature = "mock_auth")]
     MockAuth, // No authentication, used for testing purposes
 }
 
 #[derive(Debug, Error)]
-pub(crate) enum GenevaConfigClientError {
+pub enum GenevaConfigClientError {
     // Authentication-related errors
     #[error("Authentication method not implemented: {0}")]
     AuthMethodNotImplemented(String),
@@ -91,7 +96,7 @@ pub(crate) enum GenevaConfigClientError {
 }
 
 #[allow(dead_code)]
-pub(crate) type Result<T> = std::result::Result<T, GenevaConfigClientError>;
+pub type Result<T> = std::result::Result<T, GenevaConfigClientError>;
 
 /// Configuration for the Geneva Config Client.
 ///
@@ -102,9 +107,9 @@ pub(crate) type Result<T> = std::result::Result<T, GenevaConfigClientError>;
 /// * `namespace` - Namespace for the configuration
 /// * `region` - Azure region (e.g., "westus2")
 /// * `config_major_version` - Major version of the configuration schema
-/// * `auth_method` - Authentication method to use (Certificate or ManagedIdentity)
+/// * `auth_method` - Authentication method to use (Certificate or AzureArcManagedIdentity)
 ///
-/// # Example
+/// # Example - Certificate Authentication
 /// ```ignore
 /// let config = GenevaConfigClientConfig {
 ///     endpoint: "https://example.geneva.com".to_string(),
@@ -114,37 +119,50 @@ pub(crate) type Result<T> = std::result::Result<T, GenevaConfigClientError>;
 ///     region: "westus2".to_string(),
 ///     config_major_version: 1,
 ///     auth_method: AuthMethod::Certificate {
-///         path: "/path/to/cert.p12".to_string(),
+///         path: "/path/to/cert.p12".into(),
 ///         password: "password".to_string(),
 ///     },
 /// };
 /// ```
+///
+/// # Example - Azure Arc MSI Authentication
+/// ```ignore
+/// let config = GenevaConfigClientConfig {
+///     endpoint: "https://example.geneva.com".to_string(),
+///     environment: "prod".to_string(),
+///     account: "myaccount".to_string(),
+///     namespace: "myservice".to_string(),
+///     region: "westus2".to_string(),
+///     config_major_version: 1,
+///     auth_method: AuthMethod::AzureArcManagedIdentity,
+/// };
+/// ```
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
-pub(crate) struct GenevaConfigClientConfig {
-    pub(crate) endpoint: String,
-    pub(crate) environment: String,
-    pub(crate) account: String,
-    pub(crate) namespace: String,
-    pub(crate) region: String,
-    pub(crate) config_major_version: u32,
-    pub(crate) auth_method: AuthMethod, // agent_identity and agent_version are hardcoded for now
+pub struct GenevaConfigClientConfig {
+    pub endpoint: String,
+    pub environment: String,
+    pub account: String,
+    pub namespace: String,
+    pub region: String,
+    pub config_major_version: u32,
+    pub auth_method: AuthMethod, // agent_identity and agent_version are hardcoded for now
 }
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
-pub(crate) struct IngestionGatewayInfo {
+pub struct IngestionGatewayInfo {
     #[serde(rename = "Endpoint")]
-    pub(crate) endpoint: String,
+    pub endpoint: String,
     #[serde(rename = "AuthToken")]
-    pub(crate) auth_token: String,
+    pub auth_token: String,
     #[serde(rename = "AuthTokenExpiryTime")]
-    pub(crate) auth_token_expiry_time: String,
+    pub auth_token_expiry_time: String,
 }
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
-pub(crate) struct MonikerInfo {
+pub struct MonikerInfo {
     pub name: String,
     pub account_group: String,
 }
@@ -184,7 +202,7 @@ struct CachedAuthData {
 }
 
 #[allow(dead_code)]
-pub(crate) struct GenevaConfigClient {
+pub struct GenevaConfigClient {
     config: GenevaConfigClientConfig,
     http_client: Client,
     // TODO: revisit if the lock can be removed
@@ -193,6 +211,7 @@ pub(crate) struct GenevaConfigClient {
     agent_identity: String,
     agent_version: String,
     static_headers: HeaderMap,
+    arc_credential: Option<AzureArcManagedIdentityCredential>,
 }
 
 impl fmt::Debug for GenevaConfigClient {
@@ -224,7 +243,7 @@ impl GenevaConfigClient {
     /// * `GenevaConfigClientError::Certificate` - If reading the certificate file, parsing it, or constructing the TLS connector fails
     /// * `GenevaConfigClientError::AuthMethodNotImplemented` - If the specified authentication method is not yet supported
     #[allow(dead_code)]
-    pub(crate) fn new(config: GenevaConfigClientConfig) -> Result<Self> {
+    pub fn new(config: GenevaConfigClientConfig) -> Result<Self> {
         let mut client_builder = Client::builder()
             .http1_only()
             .timeout(Duration::from_secs(30)); //TODO - make this configurable
@@ -246,10 +265,10 @@ impl GenevaConfigClient {
                         .map_err(|e| GenevaConfigClientError::Certificate(e.to_string()))?;
                 client_builder = client_builder.use_preconfigured_tls(tls_connector);
             }
-            AuthMethod::ManagedIdentity => {
-                return Err(GenevaConfigClientError::AuthMethodNotImplemented(
-                    "Managed Identity authentication is not implemented yet".into(),
-                ));
+            AuthMethod::AzureArcManagedIdentity => {
+                // For Azure Arc MSI, we just use the default client builder
+                // The authentication will be handled separately through Azure Core
+                // when making requests to get auth tokens
             }
             #[cfg(feature = "mock_auth")]
             AuthMethod::MockAuth => {
@@ -284,6 +303,20 @@ impl GenevaConfigClient {
 
         let http_client = client_builder.build()?;
 
+        // Initialize Arc credential if using Azure Arc MSI
+        let arc_credential = match &config.auth_method {
+            AuthMethod::AzureArcManagedIdentity => {
+                let azure_http_client: Arc<dyn azure_core::http::HttpClient> = new_http_client();
+                Some(
+                    AzureArcManagedIdentityCredential::new(azure_http_client)
+                        .map_err(|e| GenevaConfigClientError::AuthMethodNotImplemented(
+                            format!("Failed to initialize Azure Arc MSI credential: {}", e)
+                        ))?
+                )
+            },
+            _ => None,
+        };
+
         Ok(Self {
             config,
             http_client,
@@ -292,6 +325,7 @@ impl GenevaConfigClient {
             agent_identity: agent_identity.to_string(), // TODO make this configurable
             agent_version: "1.0".to_string(),           // TODO make this configurable
             static_headers,
+            arc_credential,
         })
     }
 
@@ -354,7 +388,7 @@ impl GenevaConfigClient {
     /// * `GenevaConfigClientError::AuthInfoNotFound` - If the response doesn't contain ingestion info
     /// * `GenevaConfigClientError::SerdeJson` - If JSON parsing fails
     #[allow(dead_code)]
-    pub(crate) async fn get_ingestion_info(
+    pub async fn get_ingestion_info(
         &self,
     ) -> Result<(IngestionGatewayInfo, MonikerInfo, String)> {
         // First, try to read from cache (shared read access)
@@ -416,6 +450,30 @@ impl GenevaConfigClient {
         ))
     }
 
+    /// Gets an Azure access token using Azure Arc MSI
+    async fn get_azure_arc_token(&self, resource: &str) -> Result<String> {
+        match &self.arc_credential {
+            Some(credential) => {
+                let scope = if resource.ends_with("/.default") {
+                    resource.to_string()
+                } else {
+                    format!("{}/.default", resource)
+                };
+
+                let token = credential.get_token(&[&scope], None)
+                    .await
+                    .map_err(|e| GenevaConfigClientError::AuthMethodNotImplemented(
+                        format!("Failed to get Azure Arc MSI token: {}", e)
+                    ))?;
+
+                Ok(token.token.secret().to_string())
+            },
+            None => Err(GenevaConfigClientError::AuthMethodNotImplemented(
+                "Azure Arc MSI credential not initialized".into()
+            )),
+        }
+    }
+
     /// Internal method that actually fetches data from Geneva Config Service
     async fn fetch_ingestion_info(&self) -> Result<(IngestionGatewayInfo, MonikerInfo)> {
         let tag_id = Uuid::new_v4().to_string(); //TODO - uuid is costly, check if counter is enough?
@@ -432,6 +490,13 @@ impl GenevaConfigClient {
             .headers(self.static_headers.clone()); // Clone only cheap references
 
         request = request.header("x-ms-client-request-id", req_id);
+
+        // Add Authorization header for Azure Arc MSI
+        if matches!(self.config.auth_method, AuthMethod::AzureArcManagedIdentity) {
+            // For Geneva Config Service, we typically need https://management.azure.com scope
+            let token = self.get_azure_arc_token("https://management.azure.com").await?;
+            request = request.header("Authorization", format!("Bearer {}", token));
+        }
         let response = request
             .send()
             .await

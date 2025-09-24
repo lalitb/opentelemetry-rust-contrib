@@ -1,4 +1,5 @@
 pub(crate) mod client;
+pub mod azure_arc_msi;
 
 #[cfg(test)]
 mod tests {
@@ -20,12 +21,12 @@ mod tests {
             namespace: "ns".to_string(),
             region: "region".to_string(),
             config_major_version: 1,
-            auth_method: AuthMethod::ManagedIdentity,
+            auth_method: AuthMethod::AzureArcManagedIdentity,
         };
 
         assert_eq!(config.environment, "env");
         assert_eq!(config.account, "acct");
-        assert!(matches!(config.auth_method, AuthMethod::ManagedIdentity));
+        assert!(matches!(config.auth_method, AuthMethod::AzureArcManagedIdentity));
     }
 
     fn generate_self_signed_p12() -> (NamedTempFile, String) {
