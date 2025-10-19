@@ -1,16 +1,13 @@
 //! High-level GenevaClient for user code. Wraps config_service and ingestion_service.
 
 use crate::config_service::client::{AuthMethod, GenevaConfigClient, GenevaConfigClientConfig};
-// ManagedIdentitySelector removed; no re-export needed.
 use crate::ingestion_service::uploader::{GenevaUploader, GenevaUploaderConfig};
-use crate::payload_encoder::otlp_encoder::OtlpEncoder;
-use opentelemetry_proto::tonic::logs::v1::ResourceLogs;
-use opentelemetry_proto::tonic::trace::v1::ResourceSpans;
+use crate::payload_encoder::TelemetryEncoder;
 use std::sync::Arc;
 use tracing::{debug, info};
 
 /// Public batch type (already LZ4 chunked compressed).
-/// Produced by `OtlpEncoder::encode_log_batch` and returned to callers.
+/// Produced by encoders and returned to callers.
 #[derive(Debug, Clone)]
 pub struct EncodedBatch {
     pub event_name: String,
@@ -32,21 +29,22 @@ pub struct GenevaClientConfig {
     pub role_name: String,
     pub role_instance: String,
     pub msi_resource: Option<String>, // Required for Managed Identity variants
-                                      // Add event name/version here if constant, or per-upload if you want them per call.
 }
 
 /// Main user-facing client for Geneva ingestion.
+/// Generic over the encoder type (OtlpEncoder or OtapEncoder).
 #[derive(Clone)]
-pub struct GenevaClient {
+pub struct GenevaClient<E: TelemetryEncoder> {
     uploader: Arc<GenevaUploader>,
-    encoder: OtlpEncoder,
+    encoder: E,
     metadata: String,
 }
 
-impl GenevaClient {
-    pub fn new(cfg: GenevaClientConfig) -> Result<Self, String> {
+impl<E: TelemetryEncoder> GenevaClient<E> {
+    /// Create a new GenevaClient with a specific encoder
+    pub fn new_with_encoder(cfg: GenevaClientConfig, encoder: E) -> Result<Self, String> {
         info!(
-            name: "client.new",
+            name: "client.new_with_encoder",
             target: "geneva-uploader",
             endpoint = %cfg.endpoint,
             namespace = %cfg.namespace,
@@ -62,7 +60,7 @@ impl GenevaClient {
             | AuthMethod::UserManagedIdentityByResourceId { .. } => {
                 if cfg.msi_resource.is_none() {
                     debug!(
-                        name: "client.new.validate_msi_resource",
+                        name: "client.new_with_encoder.validate_msi_resource",
                         target: "geneva-uploader",
                         "Validation failed: msi_resource must be provided for managed identity auth"
                     );
@@ -76,6 +74,7 @@ impl GenevaClient {
             #[cfg(feature = "mock_auth")]
             AuthMethod::MockAuth => {}
         }
+
         let config_client_config = GenevaConfigClientConfig {
             endpoint: cfg.endpoint,
             environment: cfg.environment.clone(),
@@ -86,10 +85,11 @@ impl GenevaClient {
             auth_method: cfg.auth_method,
             msi_resource: cfg.msi_resource,
         };
+
         let config_client =
             Arc::new(GenevaConfigClient::new(config_client_config).map_err(|e| {
                 debug!(
-                    name: "client.new.config_client_init",
+                    name: "client.new_with_encoder.config_client_init",
                     target: "geneva-uploader",
                     error = %e,
                     "GenevaConfigClient init failed"
@@ -119,7 +119,7 @@ impl GenevaClient {
         let uploader =
             GenevaUploader::from_config_client(config_client, uploader_config).map_err(|e| {
                 debug!(
-                    name: "client.new.uploader_init",
+                    name: "client.new_with_encoder.uploader_init",
                     target: "geneva-uploader",
                     error = %e,
                     "GenevaUploader init failed"
@@ -128,76 +128,26 @@ impl GenevaClient {
             })?;
 
         info!(
-            name: "client.new.complete",
+            name: "client.new_with_encoder.complete",
             target: "geneva-uploader",
             "GenevaClient initialized successfully"
         );
 
         Ok(Self {
             uploader: Arc::new(uploader),
-            encoder: OtlpEncoder::new(),
+            encoder,
             metadata,
         })
     }
 
-    /// Encode OTLP logs into LZ4 chunked compressed batches.
-    pub fn encode_and_compress_logs(
-        &self,
-        logs: &[ResourceLogs],
-    ) -> Result<Vec<EncodedBatch>, String> {
-        debug!(
-            name: "client.encode_and_compress_logs",
-            target: "geneva-uploader",
-            resource_logs_count = logs.len(),
-            "Encoding and compressing resource logs"
-        );
-
-        let log_iter = logs
-            .iter()
-            .flat_map(|resource_log| resource_log.scope_logs.iter())
-            .flat_map(|scope_log| scope_log.log_records.iter());
-
-        self.encoder
-            .encode_log_batch(log_iter, &self.metadata)
-            .map_err(|e| {
-                debug!(
-                    name: "client.encode_and_compress_logs.error",
-                    target: "geneva-uploader",
-                    error = %e,
-                    "Log compression failed"
-                );
-                format!("Compression failed: {e}")
-            })
+    /// Get a log encoder for encoding telemetry logs
+    pub fn log_encoder(&self) -> crate::payload_encoder::encoder_trait::LogEncoder<'_> {
+        self.encoder.encode_logs(&self.metadata)
     }
 
-    /// Encode OTLP spans into LZ4 chunked compressed batches.
-    pub fn encode_and_compress_spans(
-        &self,
-        spans: &[ResourceSpans],
-    ) -> Result<Vec<EncodedBatch>, String> {
-        debug!(
-            name: "client.encode_and_compress_spans",
-            target: "geneva-uploader",
-            resource_spans_count = spans.len(),
-            "Encoding and compressing resource spans"
-        );
-
-        let span_iter = spans
-            .iter()
-            .flat_map(|resource_span| resource_span.scope_spans.iter())
-            .flat_map(|scope_span| scope_span.spans.iter());
-
-        self.encoder
-            .encode_span_batch(span_iter, &self.metadata)
-            .map_err(|e| {
-                debug!(
-                    name: "client.encode_and_compress_spans.error",
-                    target: "geneva-uploader",
-                    error = %e,
-                    "Span compression failed"
-                );
-                format!("Compression failed: {e}")
-            })
+    /// Get a span encoder for encoding telemetry spans
+    pub fn span_encoder(&self) -> crate::payload_encoder::encoder_trait::SpanEncoder<'_> {
+        self.encoder.encode_spans(&self.metadata)
     }
 
     /// Upload a single compressed batch.
@@ -232,5 +182,24 @@ impl GenevaClient {
                 );
                 format!("Geneva upload failed: {e} Event: {}", batch.event_name)
             })
+    }
+}
+
+// Convenience type aliases
+pub type OtlpGenevaClient = GenevaClient<crate::payload_encoder::otlp_encoder::OtlpEncoder>;
+pub type OtapGenevaClient = GenevaClient<crate::payload_encoder::otap_encoder::OtapEncoder>;
+
+// Convenience constructors for specific encoder types
+impl OtlpGenevaClient {
+    /// Create a new GenevaClient with OTLP encoder (default)
+    pub fn new(cfg: GenevaClientConfig) -> Result<Self, String> {
+        Self::new_with_encoder(cfg, crate::payload_encoder::otlp_encoder::OtlpEncoder::new())
+    }
+}
+
+impl OtapGenevaClient {
+    /// Create a new GenevaClient with OTAP (Arrow) encoder
+    pub fn new_with_otap(cfg: GenevaClientConfig) -> Result<Self, String> {
+        Self::new_with_encoder(cfg, crate::payload_encoder::otap_encoder::OtapEncoder::new())
     }
 }

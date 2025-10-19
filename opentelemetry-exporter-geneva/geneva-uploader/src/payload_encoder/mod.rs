@@ -1,7 +1,13 @@
 pub(crate) mod bond_encoder;
 pub(crate) mod central_blob;
+pub(crate) mod encoder_trait;
+#[cfg(test)]
+mod integration_tests;
 pub(crate) mod lz4_chunked_compression;
-pub mod otlp_encoder;
+pub(crate) mod otap_encoder;
+pub(crate) mod otlp_encoder;
+
+pub use encoder_trait::TelemetryEncoder;
 
 #[cfg(test)]
 mod tests {

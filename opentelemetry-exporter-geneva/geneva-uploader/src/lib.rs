@@ -18,5 +18,6 @@ pub(crate) use ingestion_service::uploader::{
 };
 
 pub use client::EncodedBatch;
-pub use client::{GenevaClient, GenevaClientConfig};
+pub use client::{GenevaClient, GenevaClientConfig, OtapGenevaClient, OtlpGenevaClient};
 pub use config_service::client::AuthMethod;
+pub use payload_encoder::TelemetryEncoder;
