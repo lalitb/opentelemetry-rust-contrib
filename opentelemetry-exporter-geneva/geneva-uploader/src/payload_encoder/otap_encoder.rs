@@ -1,9 +1,3 @@
-// otap_encoder.rs - Direct OTAP Arrow RecordBatch to Bond encoder
-//
-// This encoder transforms OpenTelemetry Arrow Protocol (OTAP) RecordBatches directly
-// to Bond encoding without intermediate OTLP protobuf conversion, eliminating
-// unnecessary memory allocations and improving performance.
-
 use crate::client::EncodedBatch;
 use crate::payload_encoder::bond_encoder::{BondDataType, BondEncodedSchema, BondWriter, FieldDef};
 use crate::payload_encoder::central_blob::{
@@ -11,7 +5,7 @@ use crate::payload_encoder::central_blob::{
 };
 use crate::payload_encoder::lz4_chunked_compression::lz4_chunked_compression;
 use arrow::array::{
-    Array, Int32Array, RecordBatch,
+    Array, BinaryArray, FixedSizeBinaryArray, Int32Array, LargeBinaryArray, RecordBatch,
     StringArray, TimestampNanosecondArray, UInt32Array,
 };
 use arrow::datatypes::{DataType, TimeUnit};
@@ -46,6 +40,32 @@ const COL_SEVERITY_NUMBER: &str = "severity_number";
 const COL_SEVERITY_TEXT: &str = "severity_text";
 const COL_BODY: &str = "body";
 const COL_EVENT_NAME: &str = "event_name";
+
+/// Enum to hold different binary array types for trace_id/span_id
+/// This allows handling BinaryArray, LargeBinaryArray, and FixedSizeBinaryArray uniformly
+enum BinaryArrayType<'a> {
+    Binary(&'a BinaryArray),
+    LargeBinary(&'a LargeBinaryArray),
+    FixedSizeBinary(&'a FixedSizeBinaryArray),
+}
+
+impl<'a> BinaryArrayType<'a> {
+    fn is_valid(&self, index: usize) -> bool {
+        match self {
+            BinaryArrayType::Binary(arr) => arr.is_valid(index),
+            BinaryArrayType::LargeBinary(arr) => arr.is_valid(index),
+            BinaryArrayType::FixedSizeBinary(arr) => arr.is_valid(index),
+        }
+    }
+
+    fn value(&self, index: usize) -> &'a [u8] {
+        match self {
+            BinaryArrayType::Binary(arr) => arr.value(index),
+            BinaryArrayType::LargeBinary(arr) => arr.value(index),
+            BinaryArrayType::FixedSizeBinary(arr) => arr.value(index),
+        }
+    }
+}
 
 /// Encoder to write OTAP Arrow RecordBatch payload in Bond form.
 ///
@@ -129,12 +149,12 @@ impl OtapEncoder {
         let body = Self::get_body_string(logs_batch, COL_BODY);
         let event_name_array = Self::get_string_array(logs_batch, COL_EVENT_NAME);
 
-        let mut batches: HashMap<String, BatchData> = HashMap::new();
+        let mut batches: HashMap<&str, BatchData> = HashMap::new();
 
         // Iterate through each row in the Arrow batch
         for row_idx in 0..num_rows {
             // Get timestamp (prefer time_unix_nano, fall back to observed_time_unix_nano)
-            let timestamp = if let Some(arr) = &time_unix_nano {
+            let timestamp = if let Some(arr) = time_unix_nano {
                 if arr.is_valid(row_idx) {
                     arr.value(row_idx) as u64
                 } else {
@@ -145,7 +165,7 @@ impl OtapEncoder {
             };
 
             let timestamp = if timestamp == 0 {
-                if let Some(arr) = &observed_time_unix_nano {
+                if let Some(arr) = observed_time_unix_nano {
                     if arr.is_valid(row_idx) {
                         arr.value(row_idx) as u64
                     } else {
@@ -159,42 +179,40 @@ impl OtapEncoder {
             };
 
             // Get event_name (default to "Log" if empty)
-            let event_name_str = if let Some(arr) = &event_name_array {
+            let event_name_str = if let Some(arr) = event_name_array {
                 if arr.is_valid(row_idx) && !arr.value(row_idx).is_empty() {
-                    arr.value(row_idx).to_string()
+                    arr.value(row_idx)
                 } else {
-                    "Log".to_string()
+                    "Log"
                 }
             } else {
-                "Log".to_string()
+                "Log"
             };
 
             // Determine fields and schema ID for this row
             let (field_defs, schema_id) = self.determine_fields_and_schema_id(
-                logs_batch,
                 row_idx,
-                &event_name_str,
+                event_name_str,
                 trace_id.as_ref(),
                 span_id.as_ref(),
-                flags.as_ref(),
-                severity_text.as_ref(),
-                body.as_ref(),
+                flags,
+                severity_text,
+                body,
             )?;
 
             // Encode row data
             let row_buffer = self.write_row_data(
-                logs_batch,
                 row_idx,
                 &field_defs,
                 timestamp,
-                &event_name_str,
+                event_name_str,
                 trace_id.as_ref(),
                 span_id.as_ref(),
-                flags.as_ref(),
-                &severity_number,
-                severity_text.as_ref(),
-                body.as_ref(),
-                event_name_array.as_ref(),
+                flags,
+                severity_number,
+                severity_text,
+                body,
+                event_name_array,
             )?;
 
             // Get severity level (defaults to 0 if null)
@@ -205,16 +223,14 @@ impl OtapEncoder {
             };
 
             // Create or get existing batch entry
-            let entry = batches.entry(event_name_str.clone()).or_insert_with(|| {
-                BatchData {
-                    schemas: Vec::new(),
-                    events: Vec::new(),
-                    metadata: BatchMetadata {
-                        start_time: u64::MAX, // Sentinel value - will be replaced by first non-zero timestamp
-                        end_time: 0,
-                        schema_ids: String::new(),
-                    },
-                }
+            let entry = batches.entry(event_name_str).or_insert_with(|| BatchData {
+                schemas: Vec::new(),
+                events: Vec::new(),
+                metadata: BatchMetadata {
+                    start_time: u64::MAX, // Sentinel value - will be replaced by first non-zero timestamp
+                    end_time: 0,
+                    schema_ids: String::new(),
+                },
             });
 
             // Update timestamp range
@@ -233,7 +249,7 @@ impl OtapEncoder {
             let central_event = CentralEventEntry {
                 schema_id,
                 level,
-                event_name: Arc::new(event_name_str),
+                event_name: Arc::new(event_name_str.to_string()),
                 row: row_buffer,
             };
             entry.events.push(central_event);
@@ -285,7 +301,7 @@ impl OtapEncoder {
             );
 
             blobs.push(EncodedBatch {
-                event_name: batch_event_name,
+                event_name: batch_event_name.to_string(),
                 data: compressed,
                 metadata: batch_data.metadata,
             });
@@ -297,11 +313,10 @@ impl OtapEncoder {
     /// Determine fields and calculate schema ID based on Arrow RecordBatch row
     fn determine_fields_and_schema_id(
         &self,
-        _batch: &RecordBatch,
         row_idx: usize,
         event_name: &str,
-        trace_id: Option<&StringArray>,
-        span_id: Option<&StringArray>,
+        trace_id: Option<&BinaryArrayType>,
+        span_id: Option<&BinaryArrayType>,
         flags: Option<&UInt32Array>,
         severity_text: Option<&StringArray>,
         body: Option<&StringArray>,
@@ -375,13 +390,12 @@ impl OtapEncoder {
     #[allow(clippy::too_many_arguments)]
     fn write_row_data(
         &self,
-        _batch: &RecordBatch,
         row_idx: usize,
         fields: &[FieldDef],
         timestamp: u64,
         event_name_str: &str,
-        trace_id: Option<&StringArray>,
-        span_id: Option<&StringArray>,
+        trace_id: Option<&BinaryArrayType>,
+        span_id: Option<&BinaryArrayType>,
         flags: Option<&UInt32Array>,
         severity_number: &Int32Array,
         severity_text: Option<&StringArray>,
@@ -419,16 +433,18 @@ impl OtapEncoder {
                 FIELD_TRACE_ID => {
                     if let Some(arr) = trace_id {
                         if arr.is_valid(row_idx) {
-                            // get_binary_array already converted to hex string, use directly
-                            BondWriter::write_string(&mut buffer, arr.value(row_idx));
+                            let value = arr.value(row_idx);
+                            let hex = hex::encode(value);
+                            BondWriter::write_string(&mut buffer, &hex);
                         }
                     }
                 }
                 FIELD_SPAN_ID => {
                     if let Some(arr) = span_id {
                         if arr.is_valid(row_idx) {
-                            // get_binary_array already converted to hex string, use directly
-                            BondWriter::write_string(&mut buffer, arr.value(row_idx));
+                            let value = arr.value(row_idx);
+                            let hex = hex::encode(value);
+                            BondWriter::write_string(&mut buffer, &hex);
                         }
                     }
                 }
@@ -446,10 +462,10 @@ impl OtapEncoder {
                         if arr.is_valid(row_idx) && !arr.value(row_idx).is_empty() {
                             arr.value(row_idx)
                         } else {
-                            &event_name_str
+                            event_name_str
                         }
                     } else {
-                        &event_name_str
+                        event_name_str
                     };
                     BondWriter::write_string(&mut buffer, name_to_write);
                 }
@@ -498,19 +514,19 @@ impl OtapEncoder {
 
     // Helper methods to extract typed arrays from RecordBatch
 
-    fn get_timestamp_array(
-        batch: &RecordBatch,
+    fn get_timestamp_array<'a>(
+        batch: &'a RecordBatch,
         name: &str,
-    ) -> Result<Option<TimestampNanosecondArray>, String> {
+    ) -> Result<Option<&'a TimestampNanosecondArray>, String> {
         match batch.column_by_name(name) {
             Some(col) => match col.data_type() {
-                DataType::Timestamp(TimeUnit::Nanosecond, _) => {
-                    let arr = col
-                        .as_any()
-                        .downcast_ref::<TimestampNanosecondArray>()
-                        .ok_or_else(|| format!("Failed to downcast column {name} to TimestampNanosecondArray"))?;
-                    Ok(Some(arr.clone()))
-                }
+                DataType::Timestamp(TimeUnit::Nanosecond, _) => col
+                    .as_any()
+                    .downcast_ref::<TimestampNanosecondArray>()
+                    .map(Some)
+                    .ok_or_else(|| {
+                        format!("Failed to downcast column {name} to TimestampNanosecondArray")
+                    }),
                 _ => Err(format!(
                     "Column {name} has unexpected type: {:?}",
                     col.data_type()
@@ -520,76 +536,41 @@ impl OtapEncoder {
         }
     }
 
-    fn get_binary_array(batch: &RecordBatch, name: &str) -> Option<StringArray> {
+    fn get_binary_array<'a>(batch: &'a RecordBatch, name: &str) -> Option<BinaryArrayType<'a>> {
         batch.column_by_name(name).and_then(|col| {
-            // Try BinaryArray first
-            if let Some(arr) = col.as_any().downcast_ref::<arrow::array::BinaryArray>() {
-                let strings: Vec<Option<String>> = (0..arr.len())
-                    .map(|i| {
-                        if arr.is_valid(i) {
-                            Some(hex::encode(arr.value(i)))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                return Some(StringArray::from(strings));
+            if let Some(arr) = col.as_any().downcast_ref::<BinaryArray>() {
+                return Some(BinaryArrayType::Binary(arr));
             }
-            // Try FixedSizeBinaryArray (common for trace_id which is always 16 bytes)
-            if let Some(arr) = col.as_any().downcast_ref::<arrow::array::FixedSizeBinaryArray>() {
-                let strings: Vec<Option<String>> = (0..arr.len())
-                    .map(|i| {
-                        if arr.is_valid(i) {
-                            Some(hex::encode(arr.value(i)))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                return Some(StringArray::from(strings));
+            if let Some(arr) = col.as_any().downcast_ref::<LargeBinaryArray>() {
+                return Some(BinaryArrayType::LargeBinary(arr));
             }
-            // Try LargeBinaryArray
-            if let Some(arr) = col.as_any().downcast_ref::<arrow::array::LargeBinaryArray>() {
-                let strings: Vec<Option<String>> = (0..arr.len())
-                    .map(|i| {
-                        if arr.is_valid(i) {
-                            Some(hex::encode(arr.value(i)))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                return Some(StringArray::from(strings));
+            if let Some(arr) = col.as_any().downcast_ref::<FixedSizeBinaryArray>() {
+                return Some(BinaryArrayType::FixedSizeBinary(arr));
             }
             None
         })
     }
 
-    fn get_u32_array(batch: &RecordBatch, name: &str) -> Option<UInt32Array> {
+    fn get_u32_array<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a UInt32Array> {
         batch
             .column_by_name(name)
             .and_then(|col| col.as_any().downcast_ref::<UInt32Array>())
-            .cloned()
     }
 
-    fn get_i32_array(batch: &RecordBatch, name: &str) -> Result<Int32Array, String> {
+    fn get_i32_array<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a Int32Array, String> {
         batch
             .column_by_name(name)
             .and_then(|col| col.as_any().downcast_ref::<Int32Array>())
-            .cloned()
             .ok_or_else(|| format!("Required column {name} not found or has wrong type"))
     }
 
-    fn get_string_array(batch: &RecordBatch, name: &str) -> Option<StringArray> {
+    fn get_string_array<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a StringArray> {
         batch
             .column_by_name(name)
             .and_then(|col| col.as_any().downcast_ref::<StringArray>())
-            .cloned()
     }
 
-    fn get_body_string(batch: &RecordBatch, name: &str) -> Option<StringArray> {
-        // Body in OTAP is a struct with a value field
-        // For now, we'll extract string values
+    fn get_body_string<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a StringArray> {
         batch.column_by_name(name).and_then(|col| {
             col.as_any()
                 .downcast_ref::<arrow::array::StructArray>()
@@ -597,7 +578,6 @@ impl OtapEncoder {
                     struct_arr
                         .column_by_name("string_value")
                         .and_then(|val_col| val_col.as_any().downcast_ref::<StringArray>())
-                        .cloned()
                 })
         })
     }
