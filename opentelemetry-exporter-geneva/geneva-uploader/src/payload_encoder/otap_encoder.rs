@@ -187,6 +187,7 @@ impl OtapEncoder {
                 row_idx,
                 &field_defs,
                 timestamp,
+                &event_name_str,
                 trace_id.as_ref(),
                 span_id.as_ref(),
                 flags.as_ref(),
@@ -209,8 +210,8 @@ impl OtapEncoder {
                     schemas: Vec::new(),
                     events: Vec::new(),
                     metadata: BatchMetadata {
-                        start_time: timestamp,
-                        end_time: timestamp,
+                        start_time: u64::MAX, // Sentinel value - will be replaced by first non-zero timestamp
+                        end_time: 0,
                         schema_ids: String::new(),
                     },
                 }
@@ -241,6 +242,11 @@ impl OtapEncoder {
         // Encode and compress blobs
         let mut blobs = Vec::with_capacity(batches.len());
         for (batch_event_name, mut batch_data) in batches {
+            // If start_time is still u64::MAX, no valid timestamps were found - reset to 0
+            if batch_data.metadata.start_time == u64::MAX {
+                batch_data.metadata.start_time = 0;
+            }
+
             let schema_ids_string = batch_data.format_schema_ids();
             batch_data.metadata.schema_ids = schema_ids_string;
 
@@ -373,6 +379,7 @@ impl OtapEncoder {
         row_idx: usize,
         fields: &[FieldDef],
         timestamp: u64,
+        event_name_str: &str,
         trace_id: Option<&StringArray>,
         span_id: Option<&StringArray>,
         flags: Option<&UInt32Array>,
@@ -412,18 +419,16 @@ impl OtapEncoder {
                 FIELD_TRACE_ID => {
                     if let Some(arr) = trace_id {
                         if arr.is_valid(row_idx) {
-                            let value = arr.value(row_idx);
-                            let hex = hex::encode(value);
-                            BondWriter::write_string(&mut buffer, &hex);
+                            // get_binary_array already converted to hex string, use directly
+                            BondWriter::write_string(&mut buffer, arr.value(row_idx));
                         }
                     }
                 }
                 FIELD_SPAN_ID => {
                     if let Some(arr) = span_id {
                         if arr.is_valid(row_idx) {
-                            let value = arr.value(row_idx);
-                            let hex = hex::encode(value);
-                            BondWriter::write_string(&mut buffer, &hex);
+                            // get_binary_array already converted to hex string, use directly
+                            BondWriter::write_string(&mut buffer, arr.value(row_idx));
                         }
                     }
                 }
@@ -435,11 +440,18 @@ impl OtapEncoder {
                     }
                 }
                 FIELD_NAME => {
-                    if let Some(arr) = event_name_array {
-                        if arr.is_valid(row_idx) {
-                            BondWriter::write_string(&mut buffer, arr.value(row_idx));
+                    // Always write event_name when FIELD_NAME is in schema
+                    // Use array value if present and valid, otherwise use computed event_name_str
+                    let name_to_write = if let Some(arr) = event_name_array {
+                        if arr.is_valid(row_idx) && !arr.value(row_idx).is_empty() {
+                            arr.value(row_idx)
+                        } else {
+                            &event_name_str
                         }
-                    }
+                    } else {
+                        &event_name_str
+                    };
+                    BondWriter::write_string(&mut buffer, name_to_write);
                 }
                 FIELD_SEVERITY_NUMBER => {
                     if severity_number.is_valid(row_idx) {
@@ -510,22 +522,46 @@ impl OtapEncoder {
 
     fn get_binary_array(batch: &RecordBatch, name: &str) -> Option<StringArray> {
         batch.column_by_name(name).and_then(|col| {
-            // Binary data in Arrow is often stored as LargeBinary or Binary
-            // For trace_id/span_id, we'll convert to hex strings
-            col.as_any()
-                .downcast_ref::<arrow::array::BinaryArray>()
-                .map(|arr| {
-                    let strings: Vec<Option<String>> = (0..arr.len())
-                        .map(|i| {
-                            if arr.is_valid(i) {
-                                Some(hex::encode(arr.value(i)))
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    StringArray::from(strings)
-                })
+            // Try BinaryArray first
+            if let Some(arr) = col.as_any().downcast_ref::<arrow::array::BinaryArray>() {
+                let strings: Vec<Option<String>> = (0..arr.len())
+                    .map(|i| {
+                        if arr.is_valid(i) {
+                            Some(hex::encode(arr.value(i)))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                return Some(StringArray::from(strings));
+            }
+            // Try FixedSizeBinaryArray (common for trace_id which is always 16 bytes)
+            if let Some(arr) = col.as_any().downcast_ref::<arrow::array::FixedSizeBinaryArray>() {
+                let strings: Vec<Option<String>> = (0..arr.len())
+                    .map(|i| {
+                        if arr.is_valid(i) {
+                            Some(hex::encode(arr.value(i)))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                return Some(StringArray::from(strings));
+            }
+            // Try LargeBinaryArray
+            if let Some(arr) = col.as_any().downcast_ref::<arrow::array::LargeBinaryArray>() {
+                let strings: Vec<Option<String>> = (0..arr.len())
+                    .map(|i| {
+                        if arr.is_valid(i) {
+                            Some(hex::encode(arr.value(i)))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                return Some(StringArray::from(strings));
+            }
+            None
         })
     }
 
