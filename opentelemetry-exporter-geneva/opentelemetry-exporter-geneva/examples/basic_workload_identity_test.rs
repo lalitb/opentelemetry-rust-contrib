@@ -83,7 +83,8 @@ async fn main() {
         role_name,
         role_instance,
         auth_method,
-        msi_resource: None, // Not used for Workload Identity
+        msi_resource: Some(msi_resource),
+        encoder_type: geneva_uploader::client::EncoderType::Otlp,
     };
 
     // GenevaClient::new is synchronous (returns Result), so no await is needed here.

@@ -3,11 +3,17 @@
 use crate::config_service::client::{AuthMethod, GenevaConfigClient, GenevaConfigClientConfig};
 // ManagedIdentitySelector removed; no re-export needed.
 use crate::ingestion_service::uploader::{GenevaUploader, GenevaUploaderConfig};
+use crate::payload_encoder::otap_log_encoder::OtapLogEncoder;
 use crate::payload_encoder::otlp_encoder::OtlpEncoder;
 use opentelemetry_proto::tonic::logs::v1::ResourceLogs;
 use opentelemetry_proto::tonic::trace::v1::ResourceSpans;
 use std::sync::Arc;
 use tracing::{debug, info};
+
+// Re-export OTAP log encoder types for external use
+pub use crate::payload_encoder::otap_log_encoder::{
+    AttributeValue, LogAttribute, LogBody, LogRecordData,
+};
 
 /// Public batch type (already LZ4 chunked compressed).
 /// Produced by `OtlpEncoder::encode_log_batch` and returned to callers.
@@ -16,6 +22,21 @@ pub struct EncodedBatch {
     pub event_name: String,
     pub data: Vec<u8>,
     pub metadata: crate::payload_encoder::central_blob::BatchMetadata,
+}
+
+/// Encoder type for Geneva client
+#[derive(Clone, Debug)]
+pub enum EncoderType {
+    /// Use OTLP encoder (for protobuf-based logs/spans)
+    Otlp,
+    /// Use OTAP encoder (for Arrow-based logs)
+    Otap,
+}
+
+impl Default for EncoderType {
+    fn default() -> Self {
+        EncoderType::Otlp
+    }
 }
 
 /// Configuration for GenevaClient (user-facing)
@@ -32,14 +53,21 @@ pub struct GenevaClientConfig {
     pub role_name: String,
     pub role_instance: String,
     pub msi_resource: Option<String>, // Required for Managed Identity variants
-                                      // Add event name/version here if constant, or per-upload if you want them per call.
+    pub encoder_type: EncoderType,     // Choose between OTLP and OTAP encoder
+}
+
+/// Encoder variant that holds either OTLP or OTAP encoder
+#[derive(Clone)]
+enum Encoder {
+    Otlp(OtlpEncoder),
+    Otap(OtapLogEncoder),
 }
 
 /// Main user-facing client for Geneva ingestion.
 #[derive(Clone)]
 pub struct GenevaClient {
     uploader: Arc<GenevaUploader>,
-    encoder: OtlpEncoder,
+    encoder: Encoder,
     metadata: String,
 }
 
@@ -127,77 +155,136 @@ impl GenevaClient {
                 format!("GenevaUploader init failed: {e}")
             })?;
 
+        // Create appropriate encoder based on configuration
+        let encoder = match cfg.encoder_type {
+            EncoderType::Otlp => Encoder::Otlp(OtlpEncoder::new()),
+            EncoderType::Otap => Encoder::Otap(OtapLogEncoder::new()),
+        };
+
         info!(
             name: "client.new.complete",
             target: "geneva-uploader",
+            encoder_type = ?cfg.encoder_type,
             "GenevaClient initialized successfully"
         );
 
         Ok(Self {
             uploader: Arc::new(uploader),
-            encoder: OtlpEncoder::new(),
+            encoder,
             metadata,
         })
     }
 
     /// Encode OTLP logs into LZ4 chunked compressed batches.
+    ///
+    /// This method is available when the client is configured with `EncoderType::Otlp`.
     pub fn encode_and_compress_logs(
         &self,
         logs: &[ResourceLogs],
     ) -> Result<Vec<EncodedBatch>, String> {
-        debug!(
-            name: "client.encode_and_compress_logs",
-            target: "geneva-uploader",
-            resource_logs_count = logs.len(),
-            "Encoding and compressing resource logs"
-        );
-
-        let log_iter = logs
-            .iter()
-            .flat_map(|resource_log| resource_log.scope_logs.iter())
-            .flat_map(|scope_log| scope_log.log_records.iter());
-
-        self.encoder
-            .encode_log_batch(log_iter, &self.metadata)
-            .map_err(|e| {
+        match &self.encoder {
+            Encoder::Otlp(otlp_encoder) => {
                 debug!(
-                    name: "client.encode_and_compress_logs.error",
+                    name: "client.encode_and_compress_logs",
                     target: "geneva-uploader",
-                    error = %e,
-                    "Log compression failed"
+                    resource_logs_count = logs.len(),
+                    "Encoding and compressing OTLP resource logs"
                 );
-                format!("Compression failed: {e}")
-            })
+
+                let log_iter = logs
+                    .iter()
+                    .flat_map(|resource_log| resource_log.scope_logs.iter())
+                    .flat_map(|scope_log| scope_log.log_records.iter());
+
+                otlp_encoder
+                    .encode_log_batch(log_iter, &self.metadata)
+                    .map_err(|e| {
+                        debug!(
+                            name: "client.encode_and_compress_logs.error",
+                            target: "geneva-uploader",
+                            error = %e,
+                            "OTLP log compression failed"
+                        );
+                        format!("Compression failed: {e}")
+                    })
+            }
+            Encoder::Otap(_) => Err(
+                "encode_and_compress_logs requires EncoderType::Otlp, but client is configured with EncoderType::Otap".to_string()
+            ),
+        }
+    }
+
+    /// Encode OTAP logs into LZ4 chunked compressed batches.
+    ///
+    /// This method is available when the client is configured with `EncoderType::Otap`.
+    /// It accepts log records in the `LogRecordData` format and encodes them into
+    /// Geneva-compliant batches.
+    pub fn encode_and_compress_otap_logs(
+        &self,
+        logs: &[LogRecordData],
+    ) -> Result<Vec<EncodedBatch>, String> {
+        match &self.encoder {
+            Encoder::Otap(otap_encoder) => {
+                debug!(
+                    name: "client.encode_and_compress_otap_logs",
+                    target: "geneva-uploader",
+                    log_count = logs.len(),
+                    "Encoding and compressing OTAP logs"
+                );
+
+                otap_encoder.encode_log_batch(logs, &self.metadata).map_err(|e| {
+                    debug!(
+                        name: "client.encode_and_compress_otap_logs.error",
+                        target: "geneva-uploader",
+                        error = %e,
+                        "OTAP log compression failed"
+                    );
+                    format!("Compression failed: {e}")
+                })
+            }
+            Encoder::Otlp(_) => Err(
+                "encode_and_compress_otap_logs requires EncoderType::Otap, but client is configured with EncoderType::Otlp".to_string()
+            ),
+        }
     }
 
     /// Encode OTLP spans into LZ4 chunked compressed batches.
+    ///
+    /// This method is available when the client is configured with `EncoderType::Otlp`.
     pub fn encode_and_compress_spans(
         &self,
         spans: &[ResourceSpans],
     ) -> Result<Vec<EncodedBatch>, String> {
-        debug!(
-            name: "client.encode_and_compress_spans",
-            target: "geneva-uploader",
-            resource_spans_count = spans.len(),
-            "Encoding and compressing resource spans"
-        );
-
-        let span_iter = spans
-            .iter()
-            .flat_map(|resource_span| resource_span.scope_spans.iter())
-            .flat_map(|scope_span| scope_span.spans.iter());
-
-        self.encoder
-            .encode_span_batch(span_iter, &self.metadata)
-            .map_err(|e| {
+        match &self.encoder {
+            Encoder::Otlp(otlp_encoder) => {
                 debug!(
-                    name: "client.encode_and_compress_spans.error",
+                    name: "client.encode_and_compress_spans",
                     target: "geneva-uploader",
-                    error = %e,
-                    "Span compression failed"
+                    resource_spans_count = spans.len(),
+                    "Encoding and compressing OTLP resource spans"
                 );
-                format!("Compression failed: {e}")
-            })
+
+                let span_iter = spans
+                    .iter()
+                    .flat_map(|resource_span| resource_span.scope_spans.iter())
+                    .flat_map(|scope_span| scope_span.spans.iter());
+
+                otlp_encoder
+                    .encode_span_batch(span_iter, &self.metadata)
+                    .map_err(|e| {
+                        debug!(
+                            name: "client.encode_and_compress_spans.error",
+                            target: "geneva-uploader",
+                            error = %e,
+                            "OTLP span compression failed"
+                        );
+                        format!("Compression failed: {e}")
+                    })
+            }
+            Encoder::Otap(_) => Err(
+                "encode_and_compress_spans requires EncoderType::Otlp, but client is configured with EncoderType::Otap".to_string()
+            ),
+        }
     }
 
     /// Upload a single compressed batch.

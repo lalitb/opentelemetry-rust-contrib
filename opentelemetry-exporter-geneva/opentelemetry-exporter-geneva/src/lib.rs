@@ -3,7 +3,7 @@
 
 #![warn(missing_debug_implementations, missing_docs)]
 
-mod logs;
+pub mod logs;
 mod trace;
 
 pub use logs::*;

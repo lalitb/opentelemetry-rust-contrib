@@ -105,6 +105,7 @@ async fn main() {
         role_instance,
         auth_method,
         msi_resource,
+        encoder_type: geneva_uploader::client::EncoderType::Otlp,
     };
 
     // GenevaClient::new is synchronous (returns Result), so no await is needed here.

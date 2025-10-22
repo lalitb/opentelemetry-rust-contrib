@@ -248,6 +248,8 @@ impl GenevaUploader {
             "Posting to ingestion gateway"
         );
 
+        eprintln!("📤 Uploading to Geneva: url={}", full_url);
+
         // Send the upload request
         let response = self
             .http_client
@@ -281,6 +283,9 @@ impl GenevaUploader {
                 "Upload successful"
             );
 
+            eprintln!("✅ Geneva upload SUCCESS: event={}, ticket={}, size={} bytes",
+                event_name, ingest_response.ticket, data_size);
+
             Ok(ingest_response)
         } else {
             debug!(
@@ -291,6 +296,10 @@ impl GenevaUploader {
                 body = %body,
                 "Upload failed"
             );
+
+            eprintln!("❌ Geneva upload FAILED: event={}, status={}, body={}",
+                event_name, status.as_u16(), body);
+
             Err(GenevaUploaderError::UploadFailed {
                 status: status.as_u16(),
                 message: body,

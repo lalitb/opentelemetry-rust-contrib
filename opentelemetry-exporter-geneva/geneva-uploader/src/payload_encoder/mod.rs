@@ -2,6 +2,7 @@ pub(crate) mod bond_encoder;
 pub(crate) mod central_blob;
 pub(crate) mod lz4_chunked_compression;
 pub mod otlp_encoder;
+pub(crate) mod otap_log_encoder;
 
 #[cfg(test)]
 mod tests {

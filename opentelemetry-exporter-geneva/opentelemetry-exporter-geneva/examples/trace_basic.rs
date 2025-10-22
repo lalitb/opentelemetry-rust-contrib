@@ -57,6 +57,7 @@ async fn main() {
         role_name,
         role_instance,
         msi_resource: None,
+        encoder_type: geneva_uploader::client::EncoderType::Otlp,
     };
 
     let geneva_client = GenevaClient::new(config).expect("Failed to create GenevaClient");
