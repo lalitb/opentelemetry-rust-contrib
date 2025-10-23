@@ -14,15 +14,15 @@
 //!
 //! # Example
 //!
-//! ```rust,no_run
-//! use geneva_uploader::payload_encoder::otap_log_encoder::OtapLogEncoder;
-//! # use geneva_uploader::client::EncodedBatch;
-//!
+//! ```rust,ignore
+//! // This example shows the general usage pattern
+//! // Note: OtapLogEncoder is an internal module
+//! 
 //! let encoder = OtapLogEncoder::new();
 //! let metadata = "namespace=MyNamespace/eventVersion=Ver1v0/tenant=T/role=R/roleinstance=RI";
 //!
-//! // Encode logs (using trait objects for flexibility)
-//! // let batches: Vec<EncodedBatch> = encoder.encode_log_batch(log_views, metadata)?;
+//! // Encode logs
+//! let batches = encoder.encode_log_batch(&log_records, metadata)?;
 //! ```
 
 use crate::client::EncodedBatch;

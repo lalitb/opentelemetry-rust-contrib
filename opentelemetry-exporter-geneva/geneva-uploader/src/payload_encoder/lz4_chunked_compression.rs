@@ -89,6 +89,43 @@ pub(crate) fn lz4_chunked_compression_custom<const CHUNK_SIZE: usize>(
     Ok(output)
 }
 
+/// Decompresses LZ4 chunked data back to original form
+/// Each chunk format: [4 bytes little-endian compressed_len][compressed data...]
+#[allow(dead_code)]
+pub(crate) fn lz4_chunked_decompression(compressed: &[u8]) -> Result<Vec<u8>, String> {
+    use lz4_flex::block::decompress;
+    const CHUNK_SIZE: usize = 64 * 1024;
+
+    let mut offset = 0;
+    let mut out = Vec::new();
+
+    while offset < compressed.len() {
+        if offset + 4 > compressed.len() {
+            return Err("Incomplete chunk header".to_string());
+        }
+
+        // Read compressed chunk length
+        let compressed_len =
+            u32::from_le_bytes(compressed[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+
+        if offset + compressed_len > compressed.len() {
+            return Err("Incomplete chunk data".to_string());
+        }
+
+        // Read compressed chunk
+        let chunk = &compressed[offset..offset + compressed_len];
+
+        // Decompress chunk (max size is CHUNK_SIZE)
+        let decompressed_chunk = decompress(chunk, CHUNK_SIZE)
+            .map_err(|e| format!("Decompression failed: {}", e))?;
+        out.extend_from_slice(&decompressed_chunk);
+        offset += compressed_len;
+    }
+
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::payload_encoder::lz4_chunked_compression::lz4_chunked_compression;

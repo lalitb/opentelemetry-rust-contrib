@@ -1,3 +1,4 @@
+pub(crate) mod arrow_log_encoder;
 pub(crate) mod bond_encoder;
 pub(crate) mod central_blob;
 pub(crate) mod lz4_chunked_compression;
