@@ -62,7 +62,8 @@ pub struct GenevaClientConfig {
 enum Encoder {
     Otlp(OtlpEncoder),
     Otap(OtapLogEncoder),
-    Arrow(ArrowLogEncoder),
+    // Arrow encoder needs Mutex because it has mutable cursor state
+    Arrow(Arc<std::sync::Mutex<ArrowLogEncoder>>),
 }
 
 /// Main user-facing client for Geneva ingestion.
@@ -160,7 +161,7 @@ impl GenevaClient {
         // Create appropriate encoder based on configuration
         let encoder = match cfg.encoder_type {
             EncoderType::Otlp => Encoder::Otlp(OtlpEncoder::new()),
-            EncoderType::Otap => Encoder::Arrow(ArrowLogEncoder::new()), // Use Arrow encoder for OTAP
+            EncoderType::Otap => Encoder::Arrow(Arc::new(std::sync::Mutex::new(ArrowLogEncoder::new()))), // Use Arrow encoder for OTAP
         };
 
         info!(
@@ -241,7 +242,9 @@ impl GenevaClient {
                     "Encoding and compressing Arrow logs (zero-copy)"
                 );
 
-                arrow_encoder
+                // Lock the mutex to get mutable access to the encoder
+                let mut encoder = arrow_encoder.lock().map_err(|e| format!("Failed to lock encoder: {}", e))?;
+                encoder
                     .encode_arrow_batch(logs_batch, log_attrs_batch, resource_attrs_batch, &self.metadata)
                     .map_err(|e| {
                         debug!(

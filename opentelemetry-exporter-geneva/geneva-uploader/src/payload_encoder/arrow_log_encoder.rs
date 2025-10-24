@@ -1,8 +1,8 @@
 //! Arrow Log Encoder for Geneva - Direct Arrow → Bond encoding
 //!
-//! This encoder mirrors the otlp_encoder.rs pattern but works directly with Arrow RecordBatches
-//! instead of protobuf LogRecord structs. It iterates row-by-row over Arrow columns and encodes
-//! each row directly to Bond format without intermediate allocations.
+//! This encoder uses otel-arrow-rust components for zero-copy traversal of Arrow RecordBatches.
+//! It leverages LogsArrays, Attribute16Arrays, BatchSorter, and ChildIndexIter from otel-arrow
+//! to ensure consistency with the OTLP encoder and eliminate code duplication.
 
 use crate::client::EncodedBatch;
 use crate::payload_encoder::bond_encoder::{BondDataType, BondEncodedSchema, BondWriter, FieldDef};
@@ -15,6 +15,14 @@ use chrono::{TimeZone, Utc};
 use std::borrow::Cow;
 use std::sync::Arc;
 use tracing::debug;
+
+// ✅ Import otel-arrow components for zero-copy traversal
+use otel_arrow_rust::otlp::{
+    BatchSorter, ChildIndexIter, NullableArrayAccessor,
+    SortedBatchCursor,
+};
+use otel_arrow_rust::otlp::attributes::Attribute16Arrays;
+use otel_arrow_rust::otlp::logs::LogsArrays;
 
 // Field name constants (same as otlp_encoder.rs)
 const FIELD_ENV_NAME: &str = "env_name";
@@ -29,10 +37,16 @@ const FIELD_SEVERITY_TEXT: &str = "SeverityText";
 const FIELD_BODY: &str = "body";
 
 /// Encoder to write Arrow RecordBatch logs in Bond format (zero-copy)
-#[derive(Clone)]
+///
+/// Uses otel-arrow components (LogsArrays, Attribute16Arrays, BatchSorter, ChildIndexIter)
+/// for efficient traversal and to share logic with the OTLP encoder.
 pub struct ArrowLogEncoder {
     env_name: String,
     env_ver: String,
+    // ✅ Cursor state for efficient sorted traversal (reused across batches)
+    batch_sorter: BatchSorter,
+    log_attrs_cursor: SortedBatchCursor,
+    resource_attrs_cursor: SortedBatchCursor,
 }
 
 impl ArrowLogEncoder {
@@ -40,19 +54,28 @@ impl ArrowLogEncoder {
         Self {
             env_name: "TestEnv".to_string(),
             env_ver: "4.0".to_string(),
+            batch_sorter: BatchSorter::new(),
+            log_attrs_cursor: SortedBatchCursor::new(),
+            resource_attrs_cursor: SortedBatchCursor::new(),
         }
     }
 
     pub fn with_env(env_name: String, env_ver: String) -> Self {
-        Self { env_name, env_ver }
+        Self {
+            env_name,
+            env_ver,
+            batch_sorter: BatchSorter::new(),
+            log_attrs_cursor: SortedBatchCursor::new(),
+            resource_attrs_cursor: SortedBatchCursor::new(),
+        }
     }
 
-    /// Encode Arrow RecordBatches directly to Bond format (mirroring otlp_encoder.rs pattern)
+    /// Encode Arrow RecordBatches directly to Bond format using otel-arrow components
     ///
-    /// This function works like encode_log_batch() in otlp_encoder.rs but iterates over
-    /// Arrow RecordBatch rows instead of protobuf LogRecords.
+    /// Uses LogsArrays, Attribute16Arrays, and cursor-based traversal for zero-copy processing.
+    /// This ensures consistency with the OTLP encoder and eliminates code duplication.
     pub fn encode_arrow_batch(
-        &self,
+        &mut self,  // ✅ Need mut for cursor updates
         logs_batch: &RecordBatch,
         log_attrs_batch: Option<&RecordBatch>,
         resource_attrs_batch: Option<&RecordBatch>,
@@ -114,79 +137,89 @@ impl ArrowLogEncoder {
         }
         eprintln!();
 
-        // Get Arrow column references (zero-copy) - analogous to log_record fields in otlp_encoder
-        let arrow_columns = ArrowColumns::extract(logs_batch)?;
+        // ✅ Use otel-arrow LogsArrays for zero-copy access to log fields
+        let logs_arrays = LogsArrays::try_from(logs_batch)
+            .map_err(|e| format!("Failed to parse logs batch: {}", e))?;
 
-        // Build attribute lookup maps (only once, not per-row)
-        let log_attrs_map = if let Some(attrs_batch) = log_attrs_batch {
-            let map = Self::build_log_attrs_map(attrs_batch)?;
-            eprintln!("🔍 DEBUG: Log attributes map keys: {:?}", map.keys().collect::<Vec<_>>());
-            for (key, attrs) in &map {
-                eprintln!("  parent_id {}: {} attributes", key, attrs.len());
-                for (attr_key, _, _) in attrs {
-                    eprintln!("    - {}", attr_key);
-                }
-            }
-            map
-        } else {
-            HashMap::new()
-        };
+        // ✅ Use otel-arrow Attribute16Arrays for zero-copy attribute access
+        let log_attrs_arrays = log_attrs_batch
+            .map(Attribute16Arrays::try_from)
+            .transpose()
+            .map_err(|e| format!("Failed to parse log attributes: {}", e))?;
 
-        let (resource_attrs_map, resource_ids) = if let Some(res_attrs_batch) = resource_attrs_batch {
-            let map = Self::build_resource_attrs_map(res_attrs_batch)?;
-            let ids = arrow_columns.extract_resource_ids(num_rows);
-            (map, ids)
-        } else {
-            (HashMap::new(), vec![None; num_rows])
-        };
+        let resource_attrs_arrays = resource_attrs_batch
+            .map(Attribute16Arrays::try_from)
+            .transpose()
+            .map_err(|e| format!("Failed to parse resource attributes: {}", e))?;
 
-        // Iterate over each log record row (analogous to `for log_record in logs` in otlp_encoder)
+        // ✅ Initialize cursors for sorted traversal (done once per batch)
+        if let Some(ref attrs) = log_attrs_arrays {
+            self.log_attrs_cursor.reset();
+            self.batch_sorter.init_cursor_for_u16_id_column(
+                &attrs.parent_id,
+                &mut self.log_attrs_cursor
+            );
+            eprintln!("🔍 DEBUG: Initialized log attributes cursor");
+        }
+
+        if let Some(ref attrs) = resource_attrs_arrays {
+            self.resource_attrs_cursor.reset();
+            self.batch_sorter.init_cursor_for_u16_id_column(
+                &attrs.parent_id,
+                &mut self.resource_attrs_cursor
+            );
+        }
+
+        // Iterate over each log record row
         for row_idx in 0..num_rows {
-            // Get timestamp (analogous to log_record.time_unix_nano in otlp_encoder)
-            let timestamp = arrow_columns.get_timestamp(row_idx);
+            // ✅ Use LogsArrays accessors instead of custom ArrowColumns
+            let timestamp = logs_arrays.time_unix_nano
+                .and_then(|arr| {
+                    if arr.is_null(row_idx) {
+                        None
+                    } else {
+                        Some(arr.value(row_idx) as u64)
+                    }
+                })
+                .unwrap_or(0);
 
-            // Use default event name (analogous to log_record.event_name in otlp_encoder)
             let event_name_str = "Log";
 
-            // Get the log's ID from the logs batch - this is what maps to parent_id in attributes
-            let log_id = arrow_columns.get_id(row_idx);
-            
+            // Get the log's ID from the logs batch
+            let log_id = if logs_arrays.id.is_null(row_idx) {
+                None
+            } else {
+                Some(logs_arrays.id.value(row_idx))
+            };
+
             if row_idx < 3 {
                 eprintln!("🔍 Row {}: log_id = {:?}", row_idx, log_id);
-                if let Some(id) = log_id {
-                    if let Some(attrs) = log_attrs_map.get(&id) {
-                        eprintln!("  ✅ Found {} attributes for log_id {}", attrs.len(), id);
-                    } else {
-                        eprintln!("  ❌ No attributes found for log_id {}", id);
-                    }
-                }
             }
 
-            // 1. Determine fields and schema ID (analogous to determine_fields_and_schema_id in otlp_encoder)
+            // 1. Determine fields and schema ID using otel-arrow components
             let (field_defs, schema_id) = self.determine_arrow_fields_and_schema_id(
                 log_id,
                 row_idx,
-                &arrow_columns,
-                &log_attrs_map,
-                &resource_ids,
-                &resource_attrs_map,
+                &logs_arrays,
+                log_attrs_arrays.as_ref(),
+                resource_attrs_arrays.as_ref(),
                 event_name_str,
             );
 
-            // 2. Encode row directly to Bond (analogous to write_row_data in otlp_encoder)
+            // 2. Encode row directly to Bond using otel-arrow components
             let row_buffer = self.write_arrow_row_data(
                 log_id,
                 row_idx,
-                &arrow_columns,
-                &log_attrs_map,
-                log_attrs_batch,
-                &resource_ids,
-                &resource_attrs_map,
-                resource_attrs_batch,
+                &logs_arrays,
+                log_attrs_arrays.as_ref(),
+                resource_attrs_arrays.as_ref(),
                 &field_defs,
             );
 
-            let level = arrow_columns.get_severity_number(row_idx).unwrap_or(9) as u8;
+            // ✅ Use LogsArrays accessor
+            let level = logs_arrays.severity_number.as_ref()
+                .and_then(|arr| arr.value_at(row_idx))
+                .unwrap_or(9) as u8;
 
             // 3. Create or get existing batch entry (same logic as otlp_encoder)
             let entry = batches.entry(event_name_str).or_insert_with(|| BatchData {
@@ -271,21 +304,22 @@ impl ArrowLogEncoder {
         Ok(result)
     }
 
-    /// Determine fields and schema ID from Arrow row (analogous to determine_fields_and_schema_id in otlp_encoder)
+    /// Determine fields and schema ID using otel-arrow components (zero-copy)
+    ///
+    /// Uses LogsArrays and ChildIndexIter for efficient traversal without allocations.
     fn determine_arrow_fields_and_schema_id(
-        &self,
+        &mut self,  // ✅ Need mut for cursor
         log_id: Option<u16>,
         row_idx: usize,
-        columns: &ArrowColumns,
-        log_attrs_map: &std::collections::HashMap<u16, Vec<(String, u8, usize)>>,
-        _resource_ids: &[Option<u16>],
-        _resource_attrs_map: &std::collections::HashMap<u16, Vec<(String, String)>>,
+        logs_arrays: &LogsArrays,  // ✅ otel-arrow LogsArrays
+        log_attrs_arrays: Option<&Attribute16Arrays>,  // ✅ otel-arrow Attribute16Arrays
+        _resource_attrs_arrays: Option<&Attribute16Arrays>,
         event_name: &str,
     ) -> (Vec<FieldDef>, u64) {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
-        let mut fields = Vec::with_capacity(10 + log_attrs_map.get(&(row_idx as u16)).map(|v| v.len()).unwrap_or(0));
+        let mut fields = Vec::with_capacity(20);  // Estimate
         let mut hasher = DefaultHasher::new();
         event_name.hash(&mut hasher);
 
@@ -295,34 +329,65 @@ impl ArrowLogEncoder {
         fields.push((Cow::Borrowed(FIELD_TIMESTAMP), BondDataType::BT_STRING));
         fields.push((Cow::Borrowed(FIELD_ENV_TIME), BondDataType::BT_STRING));
 
-        // Part A extension - Conditional fields
-        if columns.has_trace_id(row_idx) {
-            fields.push((Cow::Borrowed(FIELD_TRACE_ID), BondDataType::BT_STRING));
+        // Part A extension - Conditional fields (use LogsArrays)
+        if let Some(ref trace_id) = logs_arrays.trace_id {
+            if let Some(bytes) = trace_id.slice_at(row_idx) {
+                if !bytes.is_empty() {
+                    fields.push((Cow::Borrowed(FIELD_TRACE_ID), BondDataType::BT_STRING));
+                }
+            }
         }
-        if columns.has_span_id(row_idx) {
-            fields.push((Cow::Borrowed(FIELD_SPAN_ID), BondDataType::BT_STRING));
+        if let Some(ref span_id) = logs_arrays.span_id {
+            if let Some(bytes) = span_id.slice_at(row_idx) {
+                if !bytes.is_empty() {
+                    fields.push((Cow::Borrowed(FIELD_SPAN_ID), BondDataType::BT_STRING));
+                }
+            }
         }
-        if columns.has_flags(row_idx) {
-            fields.push((Cow::Borrowed(FIELD_TRACE_FLAGS), BondDataType::BT_UINT32));
+        if logs_arrays.flags.is_some() {
+            if let Some(flags) = logs_arrays.flags {
+                if !flags.is_null(row_idx) && flags.value(row_idx) != 0 {
+                    fields.push((Cow::Borrowed(FIELD_TRACE_FLAGS), BondDataType::BT_UINT32));
+                }
+            }
         }
 
-        // Part B - Core log fields
-        // Note: FIELD_SEVERITY_NUMBER is ALWAYS included (matches otlp_encoder.rs:367)
+        // Part B - Core log fields (use LogsArrays)
         fields.push((Cow::Borrowed(FIELD_SEVERITY_NUMBER), BondDataType::BT_INT32));
-        if columns.has_severity_text(row_idx) {
+        if logs_arrays.severity_text.as_ref().map_or(false, |arr| arr.is_valid(row_idx)) {
             fields.push((Cow::Borrowed(FIELD_SEVERITY_TEXT), BondDataType::BT_STRING));
         }
-        if columns.has_body(row_idx) {
+        if logs_arrays.body.is_some() {
             fields.push((Cow::Borrowed(FIELD_BODY), BondDataType::BT_STRING));
         }
 
         // Part C - Dynamic log attributes
-        // Note: Only log-level attributes are included, NOT resource attributes
-        // This matches otlp_encoder.rs behavior (line 380-391)
-        if let Some(id) = log_id {
-            if let Some(attrs) = log_attrs_map.get(&id) {
-                for (key, _, _) in attrs {
-                    fields.push((Cow::Owned(key.clone()), BondDataType::BT_STRING)); // Simplified: assume string type
+        // ✅ Use ChildIndexIter for zero-copy traversal (otel-arrow pattern)
+        if let (Some(id), Some(attrs)) = (log_id, log_attrs_arrays) {
+            // Use a TEMPORARY cursor so we do NOT consume self.log_attrs_cursor here.
+            let mut local_cursor = SortedBatchCursor::new();
+            self.batch_sorter
+                .init_cursor_for_u16_id_column(&attrs.parent_id, &mut local_cursor);
+
+            for attr_index in ChildIndexIter::new(id, &attrs.parent_id, &mut local_cursor) {
+                if let Some(key) = attrs.attr_key.str_at(attr_index) {
+                    let attr_type_code = attrs
+                        .anyval_arrays
+                        .attr_type
+                        .value_at(attr_index)
+                        .unwrap_or(1);
+
+                    let bond_type = match attr_type_code {
+                        1 => BondDataType::BT_STRING,
+                        2 => BondDataType::BT_INT64,
+                        3 => BondDataType::BT_DOUBLE,
+                        4 => BondDataType::BT_BOOL,
+                        _ => {
+                            eprintln!("  ⚠️  Skipping unsupported attribute type code {} for key {}", attr_type_code, key);
+                            continue;
+                        }
+                    };
+                    fields.push((Cow::Owned(key.to_string()), bond_type));
                 }
             }
         }
@@ -348,24 +413,46 @@ impl ArrowLogEncoder {
         (field_defs, hasher.finish())
     }
 
-    /// Write Arrow row data directly to Bond (analogous to write_row_data in otlp_encoder)
+    /// Write Arrow row data directly to Bond using otel-arrow components (zero-copy)
+    ///
+    /// Uses LogsArrays and ChildIndexIter for efficient attribute access.
     fn write_arrow_row_data(
-        &self,
+        &mut self,  // ✅ Need mut for cursor
         log_id: Option<u16>,
         row_idx: usize,
-        columns: &ArrowColumns,
-        log_attrs_map: &std::collections::HashMap<u16, Vec<(String, u8, usize)>>,
-        log_attrs_batch: Option<&RecordBatch>,
-        _resource_ids: &[Option<u16>],
-        _resource_attrs_map: &std::collections::HashMap<u16, Vec<(String, String)>>,
-        _resource_attrs_batch: Option<&RecordBatch>,
+        logs_arrays: &LogsArrays,  // ✅ otel-arrow LogsArrays
+        log_attrs_arrays: Option<&Attribute16Arrays>,  // ✅ otel-arrow Attribute16Arrays
+        _resource_attrs_arrays: Option<&Attribute16Arrays>,
         fields: &[FieldDef],
     ) -> Vec<u8> {
         let mut buffer = Vec::with_capacity(fields.len() * 50);
 
         eprintln!("🔍 DEBUG [Row {}] Starting Bond encoding", row_idx);
 
-        let formatted_timestamp = Self::format_timestamp(columns.get_timestamp(row_idx));
+        // ✅ Use LogsArrays accessor
+        let timestamp = logs_arrays.time_unix_nano
+            .and_then(|arr| arr.value_at(row_idx))
+            .map(|t| t as u64)
+            .unwrap_or(0);
+        let formatted_timestamp = Self::format_timestamp(timestamp);
+
+        // Precompute attribute indices & types for this row (avoid consuming shared cursor multiple times)
+        let mut row_attr_indices: Vec<(String, u8, usize)> = Vec::new();
+        if let (Some(id), Some(attrs)) = (log_id, log_attrs_arrays) {
+            let mut local_cursor = SortedBatchCursor::new();
+            self.batch_sorter
+                .init_cursor_for_u16_id_column(&attrs.parent_id, &mut local_cursor);
+            for attr_index in ChildIndexIter::new(id, &attrs.parent_id, &mut local_cursor) {
+                if let Some(key) = attrs.attr_key.str_at(attr_index) {
+                    let attr_type = attrs
+                        .anyval_arrays
+                        .attr_type
+                        .value_at(attr_index)
+                        .unwrap_or(1);
+                    row_attr_indices.push((key.to_string(), attr_type, attr_index));
+                }
+            }
+        }
 
         for field in fields {
             match field.name.as_ref() {
@@ -382,278 +469,131 @@ impl ArrowLogEncoder {
                     BondWriter::write_string(&mut buffer, &formatted_timestamp);
                 }
                 FIELD_TRACE_ID => {
-                    if let Some(trace_id) = columns.get_trace_id(row_idx) {
-                        eprintln!("  📝 {} = {}", FIELD_TRACE_ID, trace_id);
-                        BondWriter::write_string(&mut buffer, &trace_id);
+                    // ✅ Use LogsArrays accessor
+                    if let Some(ref trace_id) = logs_arrays.trace_id {
+                        if let Some(bytes) = trace_id.slice_at(row_idx) {
+                            let trace_id_hex = hex::encode(bytes);
+                            eprintln!("  📝 {} = {}", FIELD_TRACE_ID, trace_id_hex);
+                            BondWriter::write_string(&mut buffer, &trace_id_hex);
+                        }
                     }
                 }
                 FIELD_SPAN_ID => {
-                    if let Some(span_id) = columns.get_span_id(row_idx) {
-                        eprintln!("  📝 {} = {}", FIELD_SPAN_ID, span_id);
-                        BondWriter::write_string(&mut buffer, &span_id);
+                    // ✅ Use LogsArrays accessor
+                    if let Some(ref span_id) = logs_arrays.span_id {
+                        if let Some(bytes) = span_id.slice_at(row_idx) {
+                            let span_id_hex = hex::encode(bytes);
+                            eprintln!("  📝 {} = {}", FIELD_SPAN_ID, span_id_hex);
+                            BondWriter::write_string(&mut buffer, &span_id_hex);
+                        }
                     }
                 }
                 FIELD_TRACE_FLAGS => {
-                    if let Some(flags) = columns.get_flags(row_idx) {
-                        eprintln!("  📝 {} = {}", FIELD_TRACE_FLAGS, flags);
-                        BondWriter::write_numeric(&mut buffer, flags);
+                    // ✅ Use LogsArrays accessor
+                    if let Some(flags) = logs_arrays.flags {
+                        if !flags.is_null(row_idx) {
+                            let flags_val = flags.value(row_idx);
+                            eprintln!("  📝 {} = {}", FIELD_TRACE_FLAGS, flags_val);
+                            BondWriter::write_numeric(&mut buffer, flags_val);
+                        }
                     }
                 }
                 FIELD_SEVERITY_NUMBER => {
-                    let num = columns.get_severity_number(row_idx).unwrap_or(0);
+                    // ✅ Use LogsArrays accessor
+                    let num = logs_arrays.severity_number.as_ref()
+                        .and_then(|arr| arr.value_at(row_idx))
+                        .unwrap_or(0);
                     eprintln!("  📝 {} = {}", FIELD_SEVERITY_NUMBER, num);
                     BondWriter::write_numeric(&mut buffer, num);
                 }
                 FIELD_SEVERITY_TEXT => {
-                    if let Some(text) = columns.get_severity_text(row_idx) {
+                    // ✅ Use LogsArrays accessor
+                    if let Some(text) = logs_arrays.severity_text.as_ref().and_then(|arr| arr.str_at(row_idx)) {
                         eprintln!("  📝 {} = {}", FIELD_SEVERITY_TEXT, text);
                         BondWriter::write_string(&mut buffer, text);
                     }
                 }
                 FIELD_BODY => {
-                    if let Some(body) = columns.get_body(row_idx) {
-                        eprintln!("  📝 {} = {}", FIELD_BODY, body);
-                        BondWriter::write_string(&mut buffer, body);
+                    // ✅ Use LogsArrays accessor - access body from AnyValue
+                    if let Some(body_arrays) = &logs_arrays.body {
+                        if let Some(body_str) = body_arrays.anyval_arrays.attr_str.as_ref().and_then(|arr| arr.str_at(row_idx)) {
+                            eprintln!("  📝 {} = {}", FIELD_BODY, body_str);
+                            BondWriter::write_string(&mut buffer, body_str);
+                        }
                     }
                 }
                 _ => {
-                    // Handle log attributes only (NOT resource attributes)
-                    // Use log_id to look up attributes, not row_idx
                     if row_idx < 2 {
                         eprintln!("  🔍 Looking for field '{}' in attributes", field.name);
                     }
-                    if let Some(id) = log_id {
-                        if let Some(attrs) = log_attrs_map.get(&id) {
-                            if row_idx < 2 {
-                                eprintln!("    Found {} attributes for id {}", attrs.len(), id);
-                            }
-                            for (key, attr_type, attr_idx) in attrs {
-                                if key == field.name.as_ref() {
-                                    if let Some(value) = Self::extract_attribute_value(
-                                        log_attrs_batch.unwrap(),
-                                        *attr_type,
-                                        *attr_idx,
-                                    ) {
-                                        eprintln!("  📝 [LOG_ATTR] {} = {}", key, value);
-                                        BondWriter::write_string(&mut buffer, &value);
+                    if let (Some(_id), Some(attrs)) = (log_id, log_attrs_arrays) {
+                        if let Some((_, attr_type, attr_index)) = row_attr_indices
+                            .iter()
+                            .find(|(k, _, _)| k == field.name.as_ref())
+                        {
+                            match *attr_type {
+                                1 => {
+                                    if let Some(val) = attrs
+                                        .anyval_arrays
+                                        .attr_str
+                                        .as_ref()
+                                        .and_then(|arr| arr.str_at(*attr_index))
+                                    {
+                                        eprintln!("  📝 [LOG_ATTR:str] {} = {}", field.name, val);
+                                        BondWriter::write_string(&mut buffer, val);
                                     }
-                                    break;
+                                }
+                                2 => {
+                                    if let Some(val) = attrs
+                                        .anyval_arrays
+                                        .attr_int
+                                        .as_ref()
+                                        .and_then(|arr| arr.value_at(*attr_index))
+                                    {
+                                        eprintln!("  📝 [LOG_ATTR:int] {} = {}", field.name, val);
+                                        BondWriter::write_numeric(&mut buffer, val);
+                                    }
+                                }
+                                3 => {
+                                    if let Some(double_arr) = attrs.anyval_arrays.attr_double {
+                                        if !double_arr.is_null(*attr_index) {
+                                            let val = double_arr.value(*attr_index);
+                                            eprintln!("  📝 [LOG_ATTR:double] {} = {}", field.name, val);
+                                            BondWriter::write_numeric(&mut buffer, val);
+                                        }
+                                    }
+                                }
+                                4 => {
+                                    if let Some(bool_arr) = attrs.anyval_arrays.attr_bool {
+                                        if !bool_arr.is_null(*attr_index) {
+                                            let val = bool_arr.value(*attr_index);
+                                            eprintln!("  📝 [LOG_ATTR:bool] {} = {}", field.name, val);
+                                            BondWriter::write_bool(&mut buffer, val);
+                                        }
+                                    }
+                                }
+                                other => {
+                                    eprintln!(
+                                        "  ⚠️  Unsupported attribute type code {} for key {}",
+                                        other, field.name
+                                    );
                                 }
                             }
                         } else if row_idx < 2 {
-                            eprintln!("    ❌ No attributes found for id {}", id);
+                            eprintln!(
+                                "    ❌ Attribute '{}' not found for this log row",
+                                field.name
+                            );
                         }
+                    } else if row_idx < 2 {
+                        eprintln!("    ❌ No attributes for log");
                     }
-                    // Resource attributes are NOT written to individual log records
                 }
             }
         }
 
         eprintln!("  ✅ Row {} encoded ({} bytes)", row_idx, buffer.len());
         buffer
-    }
-
-    fn build_log_attrs_map(
-        attrs_batch: &RecordBatch,
-    ) -> Result<std::collections::HashMap<u16, Vec<(String, u8, usize)>>, String> {
-        use arrow::array::{DictionaryArray, StringArray, UInt16Array, UInt8Array};
-        use std::collections::HashMap;
-
-        let mut map: HashMap<u16, Vec<(String, u8, usize)>> = HashMap::new();
-
-        let parent_id_col = attrs_batch
-            .column_by_name("parent_id")
-            .ok_or("parent_id not found")?
-            .as_any()
-            .downcast_ref::<UInt16Array>()
-            .ok_or("parent_id not UInt16Array")?;
-
-        let key_col = attrs_batch.column_by_name("key").ok_or("key not found")?;
-        let type_col = attrs_batch
-            .column_by_name("type")
-            .ok_or("type not found")?
-            .as_any()
-            .downcast_ref::<UInt8Array>()
-            .ok_or("type not UInt8Array")?;
-
-        for attr_idx in 0..attrs_batch.num_rows() {
-            if parent_id_col.is_null(attr_idx) {
-                continue;
-            }
-
-            let parent_id = parent_id_col.value(attr_idx);
-            let key = key_col
-                .as_any()
-                .downcast_ref::<DictionaryArray<arrow::datatypes::UInt8Type>>()
-                .and_then(|dict| {
-                    if dict.is_null(attr_idx) {
-                        None
-                    } else {
-                        let key_idx = dict.keys().value(attr_idx);
-                        dict.values()
-                            .as_any()
-                            .downcast_ref::<StringArray>()
-                            .map(|vals| vals.value(key_idx as usize).to_string())
-                    }
-                });
-
-            if let Some(key) = key {
-                let attr_type = type_col.value(attr_idx);
-                map.entry(parent_id)
-                    .or_insert_with(Vec::new)
-                    .push((key, attr_type, attr_idx));
-            }
-        }
-
-        Ok(map)
-    }
-
-    fn build_resource_attrs_map(
-        res_attrs_batch: &RecordBatch,
-    ) -> Result<std::collections::HashMap<u16, Vec<(String, String)>>, String> {
-        use arrow::array::{DictionaryArray, StringArray, UInt16Array};
-        use std::collections::HashMap;
-
-        let mut map: HashMap<u16, Vec<(String, String)>> = HashMap::new();
-
-        let parent_id_col = res_attrs_batch
-            .column_by_name("parent_id")
-            .ok_or("parent_id not found")?
-            .as_any()
-            .downcast_ref::<UInt16Array>()
-            .ok_or("parent_id not UInt16Array")?;
-
-        let key_col = res_attrs_batch.column_by_name("key").ok_or("key not found")?;
-        let str_col = res_attrs_batch.column_by_name("str");
-
-        for attr_idx in 0..res_attrs_batch.num_rows() {
-            if parent_id_col.is_null(attr_idx) {
-                continue;
-            }
-
-            let resource_id = parent_id_col.value(attr_idx);
-
-            let key = key_col
-                .as_any()
-                .downcast_ref::<DictionaryArray<arrow::datatypes::UInt8Type>>()
-                .and_then(|dict| {
-                    if dict.is_null(attr_idx) {
-                        None
-                    } else {
-                        let key_idx = dict.keys().value(attr_idx);
-                        dict.values()
-                            .as_any()
-                            .downcast_ref::<StringArray>()
-                            .map(|vals| vals.value(key_idx as usize).to_string())
-                    }
-                });
-
-            let value = str_col.and_then(|col| {
-                col.as_any()
-                    .downcast_ref::<DictionaryArray<arrow::datatypes::UInt16Type>>()
-                    .and_then(|dict| {
-                        if dict.is_null(attr_idx) {
-                            None
-                        } else {
-                            let val_idx = dict.keys().value(attr_idx);
-                            dict.values()
-                                .as_any()
-                                .downcast_ref::<StringArray>()
-                                .map(|vals| vals.value(val_idx as usize).to_string())
-                        }
-                    })
-            });
-
-            if let (Some(key), Some(value)) = (key, value) {
-                map.entry(resource_id)
-                    .or_insert_with(Vec::new)
-                    .push((key, value));
-            }
-        }
-
-        Ok(map)
-    }
-
-    fn extract_attribute_value(
-        attrs_batch: &RecordBatch,
-        attr_type: u8,
-        attr_idx: usize,
-    ) -> Option<String> {
-        use arrow::array::{DictionaryArray, Int64Array, StringArray};
-
-        match attr_type {
-            1 => {
-                // String type - try both UInt8 and UInt16 dictionary keys
-                attrs_batch.column_by_name("str").and_then(|col| {
-                    // Try UInt8 keys first (most common in OTAP)
-                    col.as_any()
-                        .downcast_ref::<DictionaryArray<arrow::datatypes::UInt8Type>>()
-                        .and_then(|dict| {
-                            if dict.is_null(attr_idx) {
-                                None
-                            } else {
-                                let val_idx = dict.keys().value(attr_idx);
-                                dict.values()
-                                    .as_any()
-                                    .downcast_ref::<StringArray>()
-                                    .map(|vals| vals.value(val_idx as usize).to_string())
-                            }
-                        })
-                        .or_else(|| {
-                            // Fallback to UInt16 keys
-                            col.as_any()
-                                .downcast_ref::<DictionaryArray<arrow::datatypes::UInt16Type>>()
-                                .and_then(|dict| {
-                                    if dict.is_null(attr_idx) {
-                                        None
-                                    } else {
-                                        let val_idx = dict.keys().value(attr_idx);
-                                        dict.values()
-                                            .as_any()
-                                            .downcast_ref::<StringArray>()
-                                            .map(|vals| vals.value(val_idx as usize).to_string())
-                                    }
-                                })
-                        })
-                })
-            }
-            2 => {
-                // Int type - try both UInt8 and UInt16 dictionary keys
-                attrs_batch.column_by_name("int").and_then(|col| {
-                    // Try UInt8 keys first
-                    col.as_any()
-                        .downcast_ref::<DictionaryArray<arrow::datatypes::UInt8Type>>()
-                        .and_then(|dict| {
-                            if dict.is_null(attr_idx) {
-                                None
-                            } else {
-                                let val_idx = dict.keys().value(attr_idx);
-                                dict.values()
-                                    .as_any()
-                                    .downcast_ref::<Int64Array>()
-                                    .map(|vals| vals.value(val_idx as usize).to_string())
-                            }
-                        })
-                        .or_else(|| {
-                            // Fallback to UInt16 keys
-                            col.as_any()
-                                .downcast_ref::<DictionaryArray<arrow::datatypes::UInt16Type>>()
-                                .and_then(|dict| {
-                                    if dict.is_null(attr_idx) {
-                                        None
-                                    } else {
-                                        let val_idx = dict.keys().value(attr_idx);
-                                        dict.values()
-                                            .as_any()
-                                            .downcast_ref::<Int64Array>()
-                                            .map(|vals| vals.value(val_idx as usize).to_string())
-                                    }
-                                })
-                        })
-                })
-            }
-            _ => None,
-        }
     }
 
     fn create_schema(schema_id: u64, field_info: Vec<FieldDef>) -> CentralSchemaEntry {
@@ -682,280 +622,6 @@ impl ArrowLogEncoder {
 impl Default for ArrowLogEncoder {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-/// Helper struct to hold Arrow column references (zero-copy)
-struct ArrowColumns<'a> {
-    id: Option<&'a arrow::array::UInt16Array>,
-    time_unix_nano: Option<&'a arrow::array::TimestampNanosecondArray>,
-    observed_time_unix_nano: Option<&'a arrow::array::TimestampNanosecondArray>,
-    severity_number: Option<&'a dyn Array>,
-    severity_text: Option<&'a dyn Array>,
-    body: Option<&'a dyn Array>,
-    trace_id: Option<&'a arrow::array::BinaryArray>,
-    span_id: Option<&'a arrow::array::BinaryArray>,
-    flags: Option<&'a arrow::array::UInt32Array>,
-    resource: Option<&'a arrow::array::StructArray>,
-}
-
-impl<'a> ArrowColumns<'a> {
-    fn extract(batch: &'a RecordBatch) -> Result<Self, String> {
-        use arrow::array::{BinaryArray, StructArray, TimestampNanosecondArray, UInt16Array, UInt32Array};
-
-        Ok(Self {
-            id: batch
-                .column_by_name("id")
-                .and_then(|col| col.as_any().downcast_ref::<UInt16Array>()),
-            time_unix_nano: batch
-                .column_by_name("time_unix_nano")
-                .and_then(|col| col.as_any().downcast_ref::<TimestampNanosecondArray>()),
-            observed_time_unix_nano: batch
-                .column_by_name("observed_time_unix_nano")
-                .and_then(|col| col.as_any().downcast_ref::<TimestampNanosecondArray>()),
-            severity_number: batch.column_by_name("severity_number").map(|col| col.as_ref()),
-            severity_text: batch.column_by_name("severity_text").map(|col| col.as_ref()),
-            body: batch.column_by_name("body").map(|col| col.as_ref()),
-            trace_id: batch
-                .column_by_name("trace_id")
-                .and_then(|col| col.as_any().downcast_ref::<BinaryArray>()),
-            span_id: batch
-                .column_by_name("span_id")
-                .and_then(|col| col.as_any().downcast_ref::<BinaryArray>()),
-            flags: batch
-                .column_by_name("flags")
-                .and_then(|col| col.as_any().downcast_ref::<UInt32Array>()),
-            resource: batch
-                .column_by_name("resource")
-                .and_then(|col| col.as_any().downcast_ref::<StructArray>()),
-        })
-    }
-
-    fn get_id(&self, row_idx: usize) -> Option<u16> {
-        self.id.and_then(|arr| {
-            if arr.is_null(row_idx) {
-                None
-            } else {
-                Some(arr.value(row_idx))
-            }
-        })
-    }
-
-    fn get_timestamp(&self, row_idx: usize) -> u64 {
-        self.time_unix_nano
-            .and_then(|arr| {
-                if arr.is_null(row_idx) {
-                    None
-                } else {
-                    Some(arr.value(row_idx) as u64)
-                }
-            })
-            .or_else(|| {
-                self.observed_time_unix_nano.and_then(|arr| {
-                    if arr.is_null(row_idx) {
-                        None
-                    } else {
-                        Some(arr.value(row_idx) as u64)
-                    }
-                })
-            })
-            .unwrap_or(0)
-    }
-
-    fn has_trace_id(&self, row_idx: usize) -> bool {
-        self.trace_id
-            .map(|arr| !arr.is_null(row_idx) && !arr.value(row_idx).is_empty())
-            .unwrap_or(false)
-    }
-
-    fn get_trace_id(&self, row_idx: usize) -> Option<String> {
-        self.trace_id.and_then(|arr| {
-            if arr.is_null(row_idx) {
-                None
-            } else {
-                Some(hex::encode(arr.value(row_idx)))
-            }
-        })
-    }
-
-    fn has_span_id(&self, row_idx: usize) -> bool {
-        self.span_id
-            .map(|arr| !arr.is_null(row_idx) && !arr.value(row_idx).is_empty())
-            .unwrap_or(false)
-    }
-
-    fn get_span_id(&self, row_idx: usize) -> Option<String> {
-        self.span_id.and_then(|arr| {
-            if arr.is_null(row_idx) {
-                None
-            } else {
-                Some(hex::encode(arr.value(row_idx)))
-            }
-        })
-    }
-
-    fn has_flags(&self, row_idx: usize) -> bool {
-        self.flags
-            .map(|arr| !arr.is_null(row_idx) && arr.value(row_idx) != 0)
-            .unwrap_or(false)
-    }
-
-    fn get_flags(&self, row_idx: usize) -> Option<u32> {
-        self.flags.and_then(|arr| {
-            if arr.is_null(row_idx) {
-                None
-            } else {
-                Some(arr.value(row_idx))
-            }
-        })
-    }
-
-    fn has_severity_number(&self, row_idx: usize) -> bool {
-        self.severity_number
-            .map(|arr| !arr.is_null(row_idx))
-            .unwrap_or(false)
-    }
-
-    fn get_severity_number(&self, row_idx: usize) -> Option<i32> {
-        use arrow::array::DictionaryArray;
-
-        self.severity_number.and_then(|arr| {
-            arr.as_any()
-                .downcast_ref::<DictionaryArray<arrow::datatypes::UInt8Type>>()
-                .and_then(|dict| {
-                    if dict.is_null(row_idx) {
-                        None
-                    } else {
-                        let key = dict.keys().value(row_idx);
-                        dict.values()
-                            .as_any()
-                            .downcast_ref::<arrow::array::Int32Array>()
-                            .map(|vals| vals.value(key as usize))
-                    }
-                })
-        })
-    }
-
-    fn has_severity_text(&self, row_idx: usize) -> bool {
-        self.severity_text
-            .map(|arr| !arr.is_null(row_idx))
-            .unwrap_or(false)
-    }
-
-    fn get_severity_text(&self, row_idx: usize) -> Option<&str> {
-        use arrow::array::DictionaryArray;
-
-        self.severity_text.and_then(|arr| {
-            arr.as_any()
-                .downcast_ref::<DictionaryArray<arrow::datatypes::UInt8Type>>()
-                .and_then(|dict| {
-                    if dict.is_null(row_idx) {
-                        None
-                    } else {
-                        let key = dict.keys().value(row_idx);
-                        dict.values()
-                            .as_any()
-                            .downcast_ref::<arrow::array::StringArray>()
-                            .map(|vals| vals.value(key as usize))
-                    }
-                })
-        })
-    }
-
-    fn has_body(&self, row_idx: usize) -> bool {
-        self.body.map(|arr| !arr.is_null(row_idx)).unwrap_or(false)
-    }
-
-    fn get_body(&self, row_idx: usize) -> Option<&str> {
-        use arrow::array::{DictionaryArray, StringArray, StructArray, UInt8Array};
-
-        self.body.and_then(|arr| {
-            arr.as_any().downcast_ref::<StructArray>().and_then(|st| {
-                if st.is_null(row_idx) {
-                    None
-                } else {
-                    // First get the type field to determine which field to read
-                    let type_field = st.column_by_name("type")
-                        .and_then(|col| col.as_any().downcast_ref::<UInt8Array>())
-                        .and_then(|arr| {
-                            if arr.is_null(row_idx) {
-                                None
-                            } else {
-                                Some(arr.value(row_idx))
-                            }
-                        });
-                    
-                    // Type 1 = string
-                    if type_field == Some(1) {
-                        // Try UInt8 dictionary keys first (most common)
-                        st.column_by_name("str")
-                            .and_then(|col| {
-                                col.as_any()
-                                    .downcast_ref::<DictionaryArray<arrow::datatypes::UInt8Type>>()
-                                    .and_then(|dict| {
-                                        if dict.is_null(row_idx) {
-                                            None
-                                        } else {
-                                            let key = dict.keys().value(row_idx);
-                                            dict.values()
-                                                .as_any()
-                                                .downcast_ref::<StringArray>()
-                                                .map(|vals| vals.value(key as usize))
-                                        }
-                                    })
-                            })
-                            .or_else(|| {
-                                // Fallback to UInt16 dictionary keys
-                                st.column_by_name("str")
-                                    .and_then(|col| {
-                                        col.as_any()
-                                            .downcast_ref::<DictionaryArray<arrow::datatypes::UInt16Type>>()
-                                            .and_then(|dict| {
-                                                if dict.is_null(row_idx) {
-                                                    None
-                                                } else {
-                                                    let key = dict.keys().value(row_idx);
-                                                    dict.values()
-                                                        .as_any()
-                                                        .downcast_ref::<StringArray>()
-                                                        .map(|vals| vals.value(key as usize))
-                                                }
-                                            })
-                                    })
-                            })
-                    } else {
-                        None
-                    }
-                }
-            })
-        })
-    }
-
-    fn extract_resource_ids(&self, num_rows: usize) -> Vec<Option<u16>> {
-        if let Some(res_col) = self.resource {
-            // Get the "id" column once, outside the loop
-            if let Some(id_col) = res_col.column_by_name("id") {
-                if let Some(id_arr) = id_col.as_any().downcast_ref::<arrow::array::UInt16Array>() {
-                    // Fast path: we have the id column
-                    return (0..num_rows)
-                        .map(|row_idx| {
-                            if res_col.is_null(row_idx) || id_arr.is_null(row_idx) {
-                                None
-                            } else {
-                                Some(id_arr.value(row_idx))
-                            }
-                        })
-                        .collect();
-                }
-            }
-            
-            // If we couldn't find the id column, return all None
-            eprintln!("⚠️  WARNING: resource.id column not found. Available columns: {:?}", 
-                res_col.column_names());
-            vec![None; num_rows]
-        } else {
-            vec![None; num_rows]
-        }
     }
 }
 
@@ -1011,89 +677,113 @@ mod tests {
         }
     }
 
-    /// Create Arrow RecordBatch with the same test data
+    /// Create Arrow RecordBatch matching otel-arrow `LogsArrays` expectations
+    ///
+    /// Required columns (see `otel-arrow-rust/src/otlp/logs.rs`):
+    ///   - id: UInt16
+    ///   - time_unix_nano: Timestamp(Nanosecond)
+    ///   - severity_number: Int32
+    ///   - severity_text: Utf8
+    ///   - body: Struct {
+    ///         attribute_type: UInt8,
+    ///         attribute_str: Utf8 (optional)
+    ///     }
+    /// We only populate the minimal set used by ArrowLogEncoder parity test.
     fn create_test_arrow_batch() -> (RecordBatch, RecordBatch) {
-        // Create main logs batch
-        let time_array = Arc::new(TimestampNanosecondArray::from(vec![1700000000000000000i64]));
+        use otel_arrow_rust::schema::{consts, FieldExt};
+        use arrow::datatypes::{Fields};
 
-        // Severity number: Dictionary(UInt8, Int32)
-        let severity_keys = UInt8Array::from(vec![0u8]);
-        let severity_values = Int32Array::from(vec![9i32]);
-        let severity_array: ArrayRef = Arc::new(
-            DictionaryArray::try_new(severity_keys, Arc::new(severity_values)).unwrap()
-        );
+        // Single row id
+        let id_array = Arc::new(UInt16Array::from(vec![0u16]));
 
-        // Severity text: Dictionary(UInt8, Utf8)
-        let severity_text_keys = UInt8Array::from(vec![0u8]);
-        let severity_text_values = StringArray::from(vec!["INFO"]);
-        let severity_text_array: ArrayRef = Arc::new(
-            DictionaryArray::try_new(severity_text_keys, Arc::new(severity_text_values)).unwrap()
-        );
+        // Timestamp
+        let time_array =
+            Arc::new(TimestampNanosecondArray::from(vec![1700000000000000000i64]));
 
-        // Body: Struct with str field
-        let body_str_keys = UInt16Array::from(vec![0u16]);
-        let body_str_values = StringArray::from(vec!["Test log message"]);
-        let body_str_dict = Arc::new(
-            DictionaryArray::try_new(body_str_keys, Arc::new(body_str_values)).unwrap()
-        );
+        // Severity number (plain Int32, NOT dictionary: LogsArrays expects Int32)
+        let severity_num_array = Arc::new(Int32Array::from(vec![9i32]));
 
-        let body_struct = StructArray::from(vec![(
-            Arc::new(Field::new("str", DataType::Dictionary(Box::new(DataType::UInt16), Box::new(DataType::Utf8)), true)),
-            body_str_dict as ArrayRef,
-        )]);
+        // Severity text (plain Utf8)
+        let severity_text_array = Arc::new(StringArray::from(vec!["INFO"]));
 
+        // Body struct: attribute_type (1 = string), attribute_str = "Test log message"
+        let body_struct_fields = Fields::from(vec![
+            Field::new(consts::ATTRIBUTE_TYPE, DataType::UInt8, false),
+            Field::new(consts::ATTRIBUTE_STR, DataType::Utf8, true),
+        ]);
+        let body_attr_type = Arc::new(UInt8Array::from(vec![1u8])); // 1 => string
+        let body_attr_str = Arc::new(StringArray::from(vec!["Test log message"]));
+        let body_struct = Arc::new(StructArray::new(
+            body_struct_fields.clone(),
+            vec![body_attr_type, body_attr_str],
+            None,
+        ));
+
+        // Build schema (order not critical but keep logical grouping)
         let schema = Arc::new(Schema::new(vec![
-            Field::new("time_unix_nano", DataType::Timestamp(TimeUnit::Nanosecond, None), true),
-            Field::new("severity_number", DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::Int32)), true),
-            Field::new("severity_text", DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::Utf8)), true),
-            Field::new("body", body_struct.data_type().clone(), true),
+            Field::new(consts::ID, DataType::UInt16, true).with_plain_encoding(),
+            Field::new(
+                consts::TIME_UNIX_NANO,
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+            ),
+            Field::new(consts::SEVERITY_NUMBER, DataType::Int32, true),
+            Field::new(consts::SEVERITY_TEXT, DataType::Utf8, true),
+            Field::new(consts::BODY, body_struct.data_type().clone(), true),
         ]));
 
         let logs_batch = RecordBatch::try_new(
             schema,
             vec![
+                id_array,
                 time_array,
-                severity_array,
+                severity_num_array,
                 severity_text_array,
-                Arc::new(body_struct),
+                body_struct,
             ],
         )
-        .unwrap();
+        .expect("create logs batch");
 
-        // Create log attributes batch
-        let parent_id = UInt16Array::from(vec![0u16, 0u16, 0u16]);
+        // Create log attributes batch (parent_id=0 for all three attributes)
+        let parent_id = Arc::new(UInt16Array::from(vec![0u16, 0u16, 0u16]));
 
+        // Key dictionary
         let key_keys = UInt8Array::from(vec![0u8, 1u8, 2u8]);
-        let key_values = StringArray::from(vec!["code.file.path", "code.function.name", "code.line.number"]);
-        let key_dict = Arc::new(
-            DictionaryArray::try_new(key_keys, Arc::new(key_values)).unwrap()
-        );
+        let key_values =
+            StringArray::from(vec!["code.file.path", "code.function.name", "code.line.number"]);
+        let key_dict: ArrayRef =
+            Arc::new(DictionaryArray::try_new(key_keys, Arc::new(key_values)).unwrap());
 
-        let types = UInt8Array::from(vec![1u8, 1u8, 1u8]); // All strings (type 1)
+        // Types (all string = 1)
+        let types = Arc::new(UInt8Array::from(vec![1u8, 1u8, 1u8]));
 
+        // String values dictionary
         let str_keys = UInt16Array::from(vec![0u16, 1u16, 2u16]);
-        let str_values = StringArray::from(vec!["/test/file.py", "test_function", "42"]);
-        let str_dict = Arc::new(
-            DictionaryArray::try_new(str_keys, Arc::new(str_values)).unwrap()
-        );
+        let str_values =
+            StringArray::from(vec!["/test/file.py", "test_function", "42"]);
+        let str_dict: ArrayRef =
+            Arc::new(DictionaryArray::try_new(str_keys, Arc::new(str_values)).unwrap());
 
         let attrs_schema = Arc::new(Schema::new(vec![
             Field::new("parent_id", DataType::UInt16, true),
-            Field::new("key", DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::Utf8)), true),
+            Field::new(
+                "key",
+                DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::Utf8)),
+                true,
+            ),
             Field::new("type", DataType::UInt8, true),
-            Field::new("str", DataType::Dictionary(Box::new(DataType::UInt16), Box::new(DataType::Utf8)), true),
+            Field::new(
+                "str",
+                DataType::Dictionary(Box::new(DataType::UInt16), Box::new(DataType::Utf8)),
+                true,
+            ),
         ]));
 
         let attrs_batch = RecordBatch::try_new(
             attrs_schema,
-            vec![
-                Arc::new(parent_id),
-                key_dict,
-                Arc::new(types),
-                str_dict,
-            ],
+            vec![parent_id, key_dict, types, str_dict],
         )
-        .unwrap();
+        .expect("create attrs batch");
 
         (logs_batch, attrs_batch)
     }
@@ -1110,7 +800,7 @@ mod tests {
             .unwrap();
 
         // Encode with Arrow encoder
-        let arrow_encoder = ArrowLogEncoder::new();
+        let mut arrow_encoder = ArrowLogEncoder::new();
         let (logs_batch, attrs_batch) = create_test_arrow_batch();
         let arrow_result = arrow_encoder
             .encode_arrow_batch(&logs_batch, Some(&attrs_batch), None, metadata)

@@ -30,6 +30,8 @@ lz4_flex = { version = "0.11", features = ["safe-encode"], default-features = fa
 azure_identity = "0.27.0"
 azure_core = "0.27.0"
 tracing = "0.1"
+# otel-arrow-rust for zero-copy Arrow iteration utilities
+otel-arrow-rust = { path = "../../../otel-arrow/rust/otel-arrow-rust" }
 
 [features]
 self_signed_certs = [] # Empty by default for security
