@@ -1,8 +1,7 @@
-//! Arrow Log Encoder for Geneva - Direct Arrow → Bond encoding
+//! Arrow Log Encoder for Geneva - Arrow → Bond encoding using ArrowLogsData views
 //!
-//! This encoder uses otel-arrow-rust components for zero-copy traversal of Arrow RecordBatches.
-//! It leverages LogsArrays, Attribute16Arrays, BatchSorter, and ChildIndexIter from otel-arrow
-//! to ensure consistency with the OTLP encoder and eliminate code duplication.
+//! This encoder uses ArrowLogsData view-based API for clean, idiomatic traversal of Arrow RecordBatches.
+//! It provides a cleaner interface than direct cursor management while maintaining zero-copy semantics.
 
 use crate::client::EncodedBatch;
 use crate::payload_encoder::bond_encoder::{BondDataType, BondEncodedSchema, BondWriter, FieldDef};
@@ -16,15 +15,12 @@ use std::borrow::Cow;
 use std::sync::Arc;
 use tracing::debug;
 
-// ✅ Import otel-arrow components for zero-copy traversal
-use otel_arrow_rust::otlp::{
-    BatchSorter, ChildIndexIter, NullableArrayAccessor,
-    SortedBatchCursor,
-};
-use otel_arrow_rust::otlp::attributes::Attribute16Arrays;
-use otel_arrow_rust::otlp::logs::LogsArrays;
+// ✅ Import ArrowLogsData view-based API for clean zero-copy traversal
+use otap_df_pdata::views::otap::arrow::logs::ArrowLogsData;
+use otap_df_pdata::views::logs::{LogRecordView, LogsDataView, ResourceLogsView, ScopeLogsView};
+use otap_df_pdata::views::common::{AttributeView, AnyValueView};
 
-// Field name constants (same as otlp_encoder.rs)
+ // Field name constants (same as otlp_encoder.rs)
 const FIELD_ENV_NAME: &str = "env_name";
 const FIELD_ENV_VER: &str = "env_ver";
 const FIELD_TIMESTAMP: &str = "timestamp";
@@ -36,17 +32,15 @@ const FIELD_SEVERITY_NUMBER: &str = "SeverityNumber";
 const FIELD_SEVERITY_TEXT: &str = "SeverityText";
 const FIELD_BODY: &str = "body";
 
+
 /// Encoder to write Arrow RecordBatch logs in Bond format (zero-copy)
 ///
-/// Uses otel-arrow components (LogsArrays, Attribute16Arrays, BatchSorter, ChildIndexIter)
-/// for efficient traversal and to share logic with the OTLP encoder.
+/// Uses ArrowLogsData view-based API for clean, idiomatic traversal.
+/// Cursors are hidden within the ArrowLogsData implementation.
+#[derive(Clone)]
 pub struct ArrowLogEncoder {
     env_name: String,
     env_ver: String,
-    // ✅ Cursor state for efficient sorted traversal (reused across batches)
-    batch_sorter: BatchSorter,
-    log_attrs_cursor: SortedBatchCursor,
-    resource_attrs_cursor: SortedBatchCursor,
 }
 
 impl ArrowLogEncoder {
@@ -54,9 +48,6 @@ impl ArrowLogEncoder {
         Self {
             env_name: "TestEnv".to_string(),
             env_ver: "4.0".to_string(),
-            batch_sorter: BatchSorter::new(),
-            log_attrs_cursor: SortedBatchCursor::new(),
-            resource_attrs_cursor: SortedBatchCursor::new(),
         }
     }
 
@@ -64,18 +55,15 @@ impl ArrowLogEncoder {
         Self {
             env_name,
             env_ver,
-            batch_sorter: BatchSorter::new(),
-            log_attrs_cursor: SortedBatchCursor::new(),
-            resource_attrs_cursor: SortedBatchCursor::new(),
         }
     }
 
-    /// Encode Arrow RecordBatches directly to Bond format using otel-arrow components
+    /// Encode Arrow RecordBatches directly to Bond format using ArrowLogsData views
     ///
-    /// Uses LogsArrays, Attribute16Arrays, and cursor-based traversal for zero-copy processing.
-    /// This ensures consistency with the OTLP encoder and eliminates code duplication.
+    /// Uses ArrowLogsData view-based API for clean, zero-copy traversal.
+    /// Cursors are managed internally by the view implementation.
     pub fn encode_arrow_batch(
-        &mut self,  // ✅ Need mut for cursor updates
+        &self,  // ✅ Now &self instead of &mut self - cursors hidden in views!
         logs_batch: &RecordBatch,
         log_attrs_batch: Option<&RecordBatch>,
         resource_attrs_batch: Option<&RecordBatch>,
@@ -137,89 +125,37 @@ impl ArrowLogEncoder {
         }
         eprintln!();
 
-        // ✅ Use otel-arrow LogsArrays for zero-copy access to log fields
-        let logs_arrays = LogsArrays::try_from(logs_batch)
-            .map_err(|e| format!("Failed to parse logs batch: {}", e))?;
+        // ✅ Use ArrowLogsData view for clean, zero-copy traversal
+        let arrow_logs = ArrowLogsData::new(logs_batch, log_attrs_batch, resource_attrs_batch)
+            .map_err(|e| format!("Failed to create ArrowLogsData: {}", e))?;
 
-        // ✅ Use otel-arrow Attribute16Arrays for zero-copy attribute access
-        let log_attrs_arrays = log_attrs_batch
-            .map(Attribute16Arrays::try_from)
-            .transpose()
-            .map_err(|e| format!("Failed to parse log attributes: {}", e))?;
+        // Iterate over each resource (though Geneva flattens this)
+        let mut row_idx = 0;
+        for _resource_logs in arrow_logs.resources() {
+            for _scope_logs in _resource_logs.scopes() {
+                for log in _scope_logs.log_records() {
+                    // ✅ Use view API for clean access
+                    let timestamp = log.time_unix_nano().unwrap_or(0);
+                    let event_name_str = "Log";
 
-        let resource_attrs_arrays = resource_attrs_batch
-            .map(Attribute16Arrays::try_from)
-            .transpose()
-            .map_err(|e| format!("Failed to parse resource attributes: {}", e))?;
-
-        // ✅ Initialize cursors for sorted traversal (done once per batch)
-        if let Some(ref attrs) = log_attrs_arrays {
-            self.log_attrs_cursor.reset();
-            self.batch_sorter.init_cursor_for_u16_id_column(
-                &attrs.parent_id,
-                &mut self.log_attrs_cursor
-            );
-            eprintln!("🔍 DEBUG: Initialized log attributes cursor");
-        }
-
-        if let Some(ref attrs) = resource_attrs_arrays {
-            self.resource_attrs_cursor.reset();
-            self.batch_sorter.init_cursor_for_u16_id_column(
-                &attrs.parent_id,
-                &mut self.resource_attrs_cursor
-            );
-        }
-
-        // Iterate over each log record row
-        for row_idx in 0..num_rows {
-            // ✅ Use LogsArrays accessors instead of custom ArrowColumns
-            let timestamp = logs_arrays.time_unix_nano
-                .and_then(|arr| {
-                    if arr.is_null(row_idx) {
-                        None
-                    } else {
-                        Some(arr.value(row_idx) as u64)
+                    if row_idx < 3 {
+                        eprintln!("🔍 Row {}: timestamp = {}", row_idx, timestamp);
                     }
-                })
-                .unwrap_or(0);
 
-            let event_name_str = "Log";
+                    // 1. Determine fields and schema ID using view API
+                    let (field_defs, schema_id) = self.determine_arrow_fields_and_schema_id_from_view(
+                        &log,
+                        event_name_str,
+                    );
 
-            // Get the log's ID from the logs batch
-            let log_id = if logs_arrays.id.is_null(row_idx) {
-                None
-            } else {
-                Some(logs_arrays.id.value(row_idx))
-            };
+                    // 2. Encode row directly to Bond using view API
+                    let row_buffer = self.write_arrow_row_data_from_view(
+                        &log,
+                        &field_defs,
+                    );
 
-            if row_idx < 3 {
-                eprintln!("🔍 Row {}: log_id = {:?}", row_idx, log_id);
-            }
-
-            // 1. Determine fields and schema ID using otel-arrow components
-            let (field_defs, schema_id) = self.determine_arrow_fields_and_schema_id(
-                log_id,
-                row_idx,
-                &logs_arrays,
-                log_attrs_arrays.as_ref(),
-                resource_attrs_arrays.as_ref(),
-                event_name_str,
-            );
-
-            // 2. Encode row directly to Bond using otel-arrow components
-            let row_buffer = self.write_arrow_row_data(
-                log_id,
-                row_idx,
-                &logs_arrays,
-                log_attrs_arrays.as_ref(),
-                resource_attrs_arrays.as_ref(),
-                &field_defs,
-            );
-
-            // ✅ Use LogsArrays accessor
-            let level = logs_arrays.severity_number.as_ref()
-                .and_then(|arr| arr.value_at(row_idx))
-                .unwrap_or(9) as u8;
+                    // ✅ Use view API accessor
+                    let level = log.severity_number().unwrap_or(9) as u8;
 
             // 3. Create or get existing batch entry (same logic as otlp_encoder)
             let entry = batches.entry(event_name_str).or_insert_with(|| BatchData {
@@ -244,14 +180,18 @@ impl ArrowLogEncoder {
                 entry.schemas.push(schema_entry);
             }
 
-            // 5. Create CentralEventEntry (same logic as otlp_encoder)
-            let central_event = CentralEventEntry {
-                schema_id,
-                level,
-                event_name: Arc::new(event_name_str.to_string()),
-                row: row_buffer,
-            };
-            entry.events.push(central_event);
+                    // 5. Create CentralEventEntry (same logic as otlp_encoder)
+                    let central_event = CentralEventEntry {
+                        schema_id,
+                        level,
+                        event_name: Arc::new(event_name_str.to_string()),
+                        row: row_buffer,
+                    };
+                    entry.events.push(central_event);
+
+                    row_idx += 1;
+                }
+            }
         }
 
         // 6. Encode and compress batches (exact same logic as otlp_encoder)
@@ -304,16 +244,12 @@ impl ArrowLogEncoder {
         Ok(result)
     }
 
-    /// Determine fields and schema ID using otel-arrow components (zero-copy)
+    /// Determine fields and schema ID using ArrowLogsData view API (zero-copy)
     ///
-    /// Uses LogsArrays and ChildIndexIter for efficient traversal without allocations.
-    fn determine_arrow_fields_and_schema_id(
-        &mut self,  // ✅ Need mut for cursor
-        log_id: Option<u16>,
-        row_idx: usize,
-        logs_arrays: &LogsArrays,  // ✅ otel-arrow LogsArrays
-        log_attrs_arrays: Option<&Attribute16Arrays>,  // ✅ otel-arrow Attribute16Arrays
-        _resource_attrs_arrays: Option<&Attribute16Arrays>,
+    /// Uses LogRecordView for clean, idiomatic traversal.
+    fn determine_arrow_fields_and_schema_id_from_view(
+        &self,  // ✅ No longer need mut - cursors hidden in view!
+        log: &impl LogRecordView,
         event_name: &str,
     ) -> (Vec<FieldDef>, u64) {
         use std::collections::hash_map::DefaultHasher;
@@ -323,71 +259,162 @@ impl ArrowLogEncoder {
         let mut hasher = DefaultHasher::new();
         event_name.hash(&mut hasher);
 
+        // Detect presence of synthetic "event_name" attribute (promote to FIELD_NAME like OTLP encoder)
+        let has_event_name_attr = log
+            .attributes()
+            .any(|attr| std::str::from_utf8(attr.key()).ok() == Some("event_name") && attr.value().is_some());
+
         // Part A - Always present fields
         fields.push((Cow::Borrowed(FIELD_ENV_NAME), BondDataType::BT_STRING));
         fields.push((Cow::Borrowed(FIELD_ENV_VER), BondDataType::BT_STRING));
         fields.push((Cow::Borrowed(FIELD_TIMESTAMP), BondDataType::BT_STRING));
         fields.push((Cow::Borrowed(FIELD_ENV_TIME), BondDataType::BT_STRING));
 
-        // Part A extension - Conditional fields (use LogsArrays)
-        if let Some(ref trace_id) = logs_arrays.trace_id {
-            if let Some(bytes) = trace_id.slice_at(row_idx) {
-                if !bytes.is_empty() {
-                    fields.push((Cow::Borrowed(FIELD_TRACE_ID), BondDataType::BT_STRING));
-                }
+        // Part A extension - Conditional fields (use view API)
+        if let Some(trace_id) = log.trace_id() {
+            if trace_id.len() > 0 {
+                fields.push((Cow::Borrowed(FIELD_TRACE_ID), BondDataType::BT_STRING));
             }
         }
-        if let Some(ref span_id) = logs_arrays.span_id {
-            if let Some(bytes) = span_id.slice_at(row_idx) {
-                if !bytes.is_empty() {
-                    fields.push((Cow::Borrowed(FIELD_SPAN_ID), BondDataType::BT_STRING));
-                }
+        if let Some(span_id) = log.span_id() {
+            if span_id.len() > 0 {
+                fields.push((Cow::Borrowed(FIELD_SPAN_ID), BondDataType::BT_STRING));
             }
         }
-        if logs_arrays.flags.is_some() {
-            if let Some(flags) = logs_arrays.flags {
-                if !flags.is_null(row_idx) && flags.value(row_idx) != 0 {
-                    fields.push((Cow::Borrowed(FIELD_TRACE_FLAGS), BondDataType::BT_UINT32));
-                }
+        if let Some(flags) = log.flags() {
+            if flags != 0 {
+                fields.push((Cow::Borrowed(FIELD_TRACE_FLAGS), BondDataType::BT_UINT32));
             }
         }
 
-        // Part B - Core log fields (use LogsArrays)
+        // Part B - Core log fields (use view API)
+        // Optional promotion of event_name attribute to Bond 'name' field controlled by env:
+        //   GENEVA_PROMOTE_EVENT_NAME=1 (or 'true') to enable (default disabled to mirror OTLP encoder semantics when event_name is empty).
+        let promote_event_name = std::env::var("GENEVA_PROMOTE_EVENT_NAME")
+            .ok()
+            .map(|v| {
+                let v = v.to_ascii_lowercase();
+                v == "1" || v == "true" || v == "yes"
+            })
+            .unwrap_or(false);
+
+        if has_event_name_attr && promote_event_name {
+            fields.push((Cow::Borrowed("name"), BondDataType::BT_STRING)); // Promote attribute to canonical FIELD_NAME
+        }
         fields.push((Cow::Borrowed(FIELD_SEVERITY_NUMBER), BondDataType::BT_INT32));
-        if logs_arrays.severity_text.as_ref().map_or(false, |arr| arr.is_valid(row_idx)) {
+        if log.severity_text().is_some() {
             fields.push((Cow::Borrowed(FIELD_SEVERITY_TEXT), BondDataType::BT_STRING));
         }
-        if logs_arrays.body.is_some() {
+        if log.body().is_some() {
             fields.push((Cow::Borrowed(FIELD_BODY), BondDataType::BT_STRING));
         }
 
         // Part C - Dynamic log attributes
-        // ✅ Use ChildIndexIter for zero-copy traversal (otel-arrow pattern)
-        if let (Some(id), Some(attrs)) = (log_id, log_attrs_arrays) {
-            // Use a TEMPORARY cursor so we do NOT consume self.log_attrs_cursor here.
-            let mut local_cursor = SortedBatchCursor::new();
-            self.batch_sorter
-                .init_cursor_for_u16_id_column(&attrs.parent_id, &mut local_cursor);
+        // ✅ Use view's attribute iterator for clean traversal
+        for attr in log.attributes() {
+            let key = attr.key();
+            let key_str = std::str::from_utf8(key).unwrap_or("");
+            if key_str == "event_name" {
+                eprintln!("  🔍 Attr raw (skipping promotion target) key='{}'", key_str);
+                continue;
+            }
 
-            for attr_index in ChildIndexIter::new(id, &attrs.parent_id, &mut local_cursor) {
-                if let Some(key) = attrs.attr_key.str_at(attr_index) {
-                    let attr_type_code = attrs
-                        .anyval_arrays
-                        .attr_type
-                        .value_at(attr_index)
-                        .unwrap_or(1);
+            // Dump raw attribute info before filtering
+            match attr.value() {
+                Some(raw_val) => {
+                    let vt = raw_val.value_type();
+                    let has_str = raw_val.as_string().is_some();
+                    let has_i64 = raw_val.as_int64().is_some();
+                    let has_f64 = raw_val.as_double().is_some();
+                    let has_bool = raw_val.as_bool().is_some();
+                    eprintln!(
+                        "  🔍 Attr raw key='{}' vtype={:?} probes=str:{} int:{} dbl:{} bool:{}",
+                        key_str, vt, has_str, has_i64, has_f64, has_bool
+                    );
+                }
+                None => {
+                    eprintln!("  🔍 Attr raw key='{}' (EMPTY VALUE)", key_str);
+                }
+            }
 
-                    let bond_type = match attr_type_code {
-                        1 => BondDataType::BT_STRING,
-                        2 => BondDataType::BT_INT64,
-                        3 => BondDataType::BT_DOUBLE,
-                        4 => BondDataType::BT_BOOL,
-                        _ => {
-                            eprintln!("  ⚠️  Skipping unsupported attribute type code {} for key {}", attr_type_code, key);
-                            continue;
+            if let Some(val) = attr.value() {
+                // First attempt concrete probes
+                let (mut bond_type_opt, mut dbg_kind) = if val.as_string().is_some() {
+                    (Some(BondDataType::BT_STRING), "string")
+                } else if val.as_int64().is_some() {
+                    (Some(BondDataType::BT_INT64), "int64")
+                } else if val.as_double().is_some() {
+                    (Some(BondDataType::BT_DOUBLE), "double")
+                } else if val.as_bool().is_some() {
+                    (Some(BondDataType::BT_BOOL), "bool")
+                } else {
+                    (None, "unknown")
+                };
+
+                // --- Added override logic to correct mis-probed types (e.g. status_code seen as Bool) ---
+                {
+                    use otap_df_pdata::views::common::ValueType as VT;
+                    let declared_vt = val.value_type();
+
+                    // If declared Int64/Double but probe gave Bool (or unknown), override to declared numeric type
+                    match declared_vt {
+                        VT::Int64 => {
+                            if !matches!(bond_type_opt, Some(BondDataType::BT_INT64)) {
+                                bond_type_opt = Some(BondDataType::BT_INT64);
+                                dbg_kind = "declared_int64_override";
+                            }
                         }
+                        VT::Double => {
+                            if !matches!(bond_type_opt, Some(BondDataType::BT_DOUBLE)) {
+                                bond_type_opt = Some(BondDataType::BT_DOUBLE);
+                                dbg_kind = "declared_double_override";
+                            }
+                        }
+                        _ => {}
+                    }
+
+                    // Heuristic: numeric-looking string for status_code style keys -> INT64
+                    if key_str == "status_code" || key_str.ends_with("_code") {
+                        if let Some(BondDataType::BT_STRING) = bond_type_opt {
+                            if let Some(sbytes) = val.as_string() {
+                                if let Ok(s) = std::str::from_utf8(sbytes) {
+                                    if s.chars().all(|c| c.is_ascii_digit()) {
+                                        if s.parse::<i64>().is_ok() {
+                                            bond_type_opt = Some(BondDataType::BT_INT64);
+                                            dbg_kind = "numeric_string_coerced_to_int64";
+                                        }
+                                    }
+                                }
+                            }
+                        } else if let Some(BondDataType::BT_BOOL) = bond_type_opt {
+                            // If mis-probed as bool but declared/int fallback says Int64
+                            if declared_vt == VT::Int64 {
+                                bond_type_opt = Some(BondDataType::BT_INT64);
+                                dbg_kind = "bool_misprobe_corrected_to_int64";
+                            }
+                        }
+                    }
+                }
+
+                // Fallback to declared value_type if probes failed (covers mis-probed numeric vs bool)
+                if bond_type_opt.is_none() {
+                    use otap_df_pdata::views::common::ValueType as VT;
+                    let vt = val.value_type();
+                    bond_type_opt = match vt {
+                        VT::String => Some(BondDataType::BT_STRING),
+                        VT::Int64 => Some(BondDataType::BT_INT64),
+                        VT::Double => Some(BondDataType::BT_DOUBLE),
+                        VT::Bool => Some(BondDataType::BT_BOOL),
+                        _ => None,
                     };
-                    fields.push((Cow::Owned(key.to_string()), bond_type));
+                    dbg_kind = "fallback_declared";
+                }
+
+                if let Some(bond_type) = bond_type_opt {
+                    eprintln!("  🔧 Attr schema include: '{}' -> {} ({:?})", key_str, dbg_kind, bond_type);
+                    fields.push((Cow::Owned(key_str.to_string()), bond_type));
+                } else {
+                    eprintln!("  ⚠️  Skipping attribute '{}' (unrecognized after fallback)", key_str);
                 }
             }
         }
@@ -410,49 +437,143 @@ impl ArrowLogEncoder {
             })
             .collect();
 
-        (field_defs, hasher.finish())
+        let schema_id = hasher.finish();
+
+        // DEBUG: dump schema field ordering & types for comparison with OTLP encoder
+        if std::env::var("GENEVA_DEBUG_SCHEMA").is_ok() {
+            eprintln!("🔧 SCHEMA DEBUG (schema_id={} hash={:016x})", schema_id, schema_id);
+            for f in &field_defs {
+                eprintln!("    field_id={} name='{}' type={:?}", f.field_id, f.name, f.type_id);
+            }
+        }
+
+        (field_defs, schema_id)
     }
 
-    /// Write Arrow row data directly to Bond using otel-arrow components (zero-copy)
+    /// Write Arrow row data directly to Bond using ArrowLogsData view API (zero-copy)
     ///
-    /// Uses LogsArrays and ChildIndexIter for efficient attribute access.
-    fn write_arrow_row_data(
-        &mut self,  // ✅ Need mut for cursor
-        log_id: Option<u16>,
-        row_idx: usize,
-        logs_arrays: &LogsArrays,  // ✅ otel-arrow LogsArrays
-        log_attrs_arrays: Option<&Attribute16Arrays>,  // ✅ otel-arrow Attribute16Arrays
-        _resource_attrs_arrays: Option<&Attribute16Arrays>,
+    /// Uses LogRecordView for clean attribute access.
+    fn write_arrow_row_data_from_view(
+        &self,  // ✅ No longer need mut - cursors hidden in view!
+        log: &impl LogRecordView,
         fields: &[FieldDef],
     ) -> Vec<u8> {
         let mut buffer = Vec::with_capacity(fields.len() * 50);
 
-        eprintln!("🔍 DEBUG [Row {}] Starting Bond encoding", row_idx);
+        eprintln!("🔍 DEBUG Starting Bond encoding");
 
-        // ✅ Use LogsArrays accessor
-        let timestamp = logs_arrays.time_unix_nano
-            .and_then(|arr| arr.value_at(row_idx))
-            .map(|t| t as u64)
-            .unwrap_or(0);
+        // ✅ Use view API accessor
+        let timestamp = log.time_unix_nano().unwrap_or(0);
         let formatted_timestamp = Self::format_timestamp(timestamp);
 
-        // Precompute attribute indices & types for this row (avoid consuming shared cursor multiple times)
-        let mut row_attr_indices: Vec<(String, u8, usize)> = Vec::new();
-        if let (Some(id), Some(attrs)) = (log_id, log_attrs_arrays) {
-            let mut local_cursor = SortedBatchCursor::new();
-            self.batch_sorter
-                .init_cursor_for_u16_id_column(&attrs.parent_id, &mut local_cursor);
-            for attr_index in ChildIndexIter::new(id, &attrs.parent_id, &mut local_cursor) {
-                if let Some(key) = attrs.attr_key.str_at(attr_index) {
-                    let attr_type = attrs
-                        .anyval_arrays
-                        .attr_type
-                        .value_at(attr_index)
-                        .unwrap_or(1);
-                    row_attr_indices.push((key.to_string(), attr_type, attr_index));
+        // Precompute attributes for this row to avoid multiple iterations
+        // Optional raw dump (row encoding phase)
+        if std::env::var("GENEVA_DEBUG_ATTRS").is_ok() {
+            eprintln!("  🔎 RAW ATTR LIST (row encode) BEGIN");
+            for a in log.attributes() {
+                let k = std::str::from_utf8(a.key()).unwrap_or("<non-utf8>");
+                match a.value() {
+                    Some(v) => {
+                        #[allow(unused_imports)]
+                        use otap_df_pdata::views::common::ValueType as VT;
+                        let vt = v.value_type();
+                        let mut kinds = Vec::new();
+                        if v.as_string().is_some() { kinds.push("str"); }
+                        if v.as_int64().is_some() { kinds.push("i64"); }
+                        if v.as_double().is_some() { kinds.push("f64"); }
+                        if v.as_bool().is_some() { kinds.push("bool"); }
+                        eprintln!("    • key='{}' vtype={:?} probes={}", k, vt, kinds.join(","));
+                    }
+                    None => eprintln!("    • key='{}' (EMPTY)", k),
                 }
             }
+            eprintln!("  🔎 RAW ATTR LIST (row encode) END");
         }
+
+        // Collect per-row attributes with robust concrete type detection
+        let row_attrs: Vec<(String, BondDataType)> = log
+            .attributes()
+            .filter_map(|attr| {
+                let key = std::str::from_utf8(attr.key()).ok()?.to_string();
+                if key == "event_name" {
+                    return None;
+                }
+                let val = attr.value()?;
+                // First probe concrete accessors
+                let mut bond_type = if val.as_string().is_some() {
+                    Some(BondDataType::BT_STRING)
+                } else if val.as_int64().is_some() {
+                    Some(BondDataType::BT_INT64)
+                } else if val.as_double().is_some() {
+                    Some(BondDataType::BT_DOUBLE)
+                } else if val.as_bool().is_some() {
+                    Some(BondDataType::BT_BOOL)
+                } else {
+                    None
+                };
+
+                // --- Added override logic mirroring schema classification to ensure consistency ---
+                {
+                    use otap_df_pdata::views::common::ValueType as VT;
+                    let declared_vt = val.value_type();
+
+                    // Correct mis-probed Bool/Unknown when declared numeric
+                    match declared_vt {
+                        VT::Int64 => {
+                            if !matches!(bond_type, Some(BondDataType::BT_INT64)) {
+                                bond_type = Some(BondDataType::BT_INT64);
+                                eprintln!("  🔧 Row attr override -> INT64 (declared) key='{}'", key);
+                            }
+                        }
+                        VT::Double => {
+                            if !matches!(bond_type, Some(BondDataType::BT_DOUBLE)) {
+                                bond_type = Some(BondDataType::BT_DOUBLE);
+                                eprintln!("  🔧 Row attr override -> DOUBLE (declared) key='{}'", key);
+                            }
+                        }
+                        _ => {}
+                    }
+
+                    // Heuristic for numeric-looking status_code style keys
+                    if key == "status_code" || key.ends_with("_code") {
+                        if let Some(BondDataType::BT_STRING) = bond_type {
+                            if let Some(sbytes) = val.as_string() {
+                                if let Ok(s) = std::str::from_utf8(sbytes) {
+                                    if s.chars().all(|c| c.is_ascii_digit()) && s.parse::<i64>().is_ok() {
+                                        bond_type = Some(BondDataType::BT_INT64);
+                                        eprintln!("  🔧 Row attr coerced STRING->INT64 key='{}'", key);
+                                    }
+                                }
+                            }
+                        } else if let Some(BondDataType::BT_BOOL) = bond_type {
+                            if declared_vt == VT::Int64 {
+                                bond_type = Some(BondDataType::BT_INT64);
+                                eprintln!("  🔧 Row attr coerced BOOL->INT64 (declared) key='{}'", key);
+                            }
+                        }
+                    }
+                }
+
+                // Fallback to declared ValueType if probes failed (handles status_code mis-report)
+                if bond_type.is_none() {
+                    use otap_df_pdata::views::common::ValueType as VT;
+                    bond_type = match val.value_type() {
+                        VT::String => Some(BondDataType::BT_STRING),
+                        VT::Int64 => Some(BondDataType::BT_INT64),
+                        VT::Double => Some(BondDataType::BT_DOUBLE),
+                        VT::Bool => Some(BondDataType::BT_BOOL),
+                        _ => None,
+                    };
+                    if let Some(bt) = bond_type {
+                        eprintln!("  🔧 Attr row include (fallback) '{}' -> {:?}", key, bt);
+                    }
+                } else if let Some(bt) = bond_type {
+                    eprintln!("  🔧 Attr row include '{}' -> {:?}", key, bt);
+                }
+
+                bond_type.map(|bt| (key, bt))
+            })
+            .collect();
 
         for field in fields {
             match field.name.as_ref() {
@@ -469,130 +590,241 @@ impl ArrowLogEncoder {
                     BondWriter::write_string(&mut buffer, &formatted_timestamp);
                 }
                 FIELD_TRACE_ID => {
-                    // ✅ Use LogsArrays accessor
-                    if let Some(ref trace_id) = logs_arrays.trace_id {
-                        if let Some(bytes) = trace_id.slice_at(row_idx) {
-                            let trace_id_hex = hex::encode(bytes);
-                            eprintln!("  📝 {} = {}", FIELD_TRACE_ID, trace_id_hex);
-                            BondWriter::write_string(&mut buffer, &trace_id_hex);
-                        }
+                    // ✅ Use view API accessor
+                    if let Some(trace_id) = log.trace_id() {
+                        let trace_id_hex = hex::encode(trace_id);
+                        eprintln!("  📝 {} = {}", FIELD_TRACE_ID, trace_id_hex);
+                        BondWriter::write_string(&mut buffer, &trace_id_hex);
                     }
                 }
                 FIELD_SPAN_ID => {
-                    // ✅ Use LogsArrays accessor
-                    if let Some(ref span_id) = logs_arrays.span_id {
-                        if let Some(bytes) = span_id.slice_at(row_idx) {
-                            let span_id_hex = hex::encode(bytes);
-                            eprintln!("  📝 {} = {}", FIELD_SPAN_ID, span_id_hex);
-                            BondWriter::write_string(&mut buffer, &span_id_hex);
-                        }
+                    // ✅ Use view API accessor
+                    if let Some(span_id) = log.span_id() {
+                        let span_id_hex = hex::encode(span_id);
+                        eprintln!("  📝 {} = {}", FIELD_SPAN_ID, span_id_hex);
+                        BondWriter::write_string(&mut buffer, &span_id_hex);
                     }
                 }
                 FIELD_TRACE_FLAGS => {
-                    // ✅ Use LogsArrays accessor
-                    if let Some(flags) = logs_arrays.flags {
-                        if !flags.is_null(row_idx) {
-                            let flags_val = flags.value(row_idx);
-                            eprintln!("  📝 {} = {}", FIELD_TRACE_FLAGS, flags_val);
-                            BondWriter::write_numeric(&mut buffer, flags_val);
+                    // ✅ Use view API accessor
+                    if let Some(flags) = log.flags() {
+                        eprintln!("  📝 {} = {}", FIELD_TRACE_FLAGS, flags);
+                        BondWriter::write_numeric(&mut buffer, flags);
+                    }
+                }
+                "name" => {
+                    // Retrieve promoted event_name attribute using explicit loop to avoid temporary borrow issues (fix E0515)
+                    let mut event_name_owned: Option<String> = None;
+                    for attr in log.attributes() {
+                        if let Ok("event_name") = std::str::from_utf8(attr.key()) {
+                            if let Some(val) = attr.value() {
+                                if let Some(bytes) = val.as_string() {
+                                    if let Ok(s) = std::str::from_utf8(bytes) {
+                                        event_name_owned = Some(s.to_owned());
+                                    }
+                                }
+                            }
+                            break;
                         }
+                    }
+                    if let Some(s) = event_name_owned {
+                        eprintln!("  📝 name (promoted event_name) = {}", s);
+                        BondWriter::write_string(&mut buffer, &s);
                     }
                 }
                 FIELD_SEVERITY_NUMBER => {
-                    // ✅ Use LogsArrays accessor
-                    let num = logs_arrays.severity_number.as_ref()
-                        .and_then(|arr| arr.value_at(row_idx))
-                        .unwrap_or(0);
+                    // ✅ Use view API accessor
+                    let num = log.severity_number().unwrap_or(0);
                     eprintln!("  📝 {} = {}", FIELD_SEVERITY_NUMBER, num);
                     BondWriter::write_numeric(&mut buffer, num);
                 }
                 FIELD_SEVERITY_TEXT => {
-                    // ✅ Use LogsArrays accessor
-                    if let Some(text) = logs_arrays.severity_text.as_ref().and_then(|arr| arr.str_at(row_idx)) {
-                        eprintln!("  📝 {} = {}", FIELD_SEVERITY_TEXT, text);
-                        BondWriter::write_string(&mut buffer, text);
+                    // ✅ Use view API accessor (returns &[u8])
+                    if let Some(text_bytes) = log.severity_text() {
+                        if let Ok(text) = std::str::from_utf8(text_bytes) {
+                            eprintln!("  📝 {} = {}", FIELD_SEVERITY_TEXT, text);
+                            BondWriter::write_string(&mut buffer, text);
+                        }
                     }
                 }
                 FIELD_BODY => {
-                    // ✅ Use LogsArrays accessor - access body from AnyValue
-                    if let Some(body_arrays) = &logs_arrays.body {
-                        if let Some(body_str) = body_arrays.anyval_arrays.attr_str.as_ref().and_then(|arr| arr.str_at(row_idx)) {
-                            eprintln!("  📝 {} = {}", FIELD_BODY, body_str);
-                            BondWriter::write_string(&mut buffer, body_str);
+                    // ✅ Use view API accessor
+                    if let Some(body_value) = log.body() {
+                        if let Some(body_bytes) = body_value.as_string() {
+                            if let Ok(body_str) = std::str::from_utf8(body_bytes) {
+                                eprintln!("  📝 {} = {}", FIELD_BODY, body_str);
+                                BondWriter::write_string(&mut buffer, body_str);
+                            }
                         }
                     }
                 }
                 _ => {
-                    if row_idx < 2 {
-                        eprintln!("  🔍 Looking for field '{}' in attributes", field.name);
-                    }
-                    if let (Some(_id), Some(attrs)) = (log_id, log_attrs_arrays) {
-                        if let Some((_, attr_type, attr_index)) = row_attr_indices
-                            .iter()
-                            .find(|(k, _, _)| k == field.name.as_ref())
-                        {
-                            match *attr_type {
-                                1 => {
-                                    if let Some(val) = attrs
-                                        .anyval_arrays
-                                        .attr_str
-                                        .as_ref()
-                                        .and_then(|arr| arr.str_at(*attr_index))
-                                    {
-                                        eprintln!("  📝 [LOG_ATTR:str] {} = {}", field.name, val);
-                                        BondWriter::write_string(&mut buffer, val);
+                    eprintln!("  🔍 Looking for field '{}' in attributes", field.name);
+                    // Find matching attribute by key and get actual value from log
+                    if let Some((key, bond_type)) = row_attrs.iter().find(|(k, _)| k == field.name.as_ref()) {
+                        if let Some(attr) = log.attributes().find(|a| std::str::from_utf8(a.key()).ok() == Some(key.as_str())) {
+                            if let Some(value) = attr.value() {
+                                match bond_type {
+                                    BondDataType::BT_STRING => {
+                                        if let Some(val_bytes) = value.as_string() {
+                                            if let Ok(val) = std::str::from_utf8(val_bytes) {
+                                                eprintln!("  📝 [LOG_ATTR:str] {} = {}", field.name, val);
+                                                BondWriter::write_string(&mut buffer, val);
+                                            } else {
+                                                eprintln!("  ⚠️  Invalid UTF-8 for {}", field.name);
+                                                BondWriter::write_string(&mut buffer, "");
+                                            }
+                                        } else {
+                                            eprintln!("  ⚠️  Missing concrete string value for {}, writing empty", field.name);
+                                            BondWriter::write_string(&mut buffer, "");
+                                        }
                                     }
-                                }
-                                2 => {
-                                    if let Some(val) = attrs
-                                        .anyval_arrays
-                                        .attr_int
-                                        .as_ref()
-                                        .and_then(|arr| arr.value_at(*attr_index))
-                                    {
-                                        eprintln!("  📝 [LOG_ATTR:int] {} = {}", field.name, val);
-                                        BondWriter::write_numeric(&mut buffer, val);
+                                    BondDataType::BT_INT64 => {
+                                        if let Some(val) = value.as_int64() {
+                                            eprintln!("  📝 [LOG_ATTR:int] {} = {}", field.name, val);
+                                            BondWriter::write_numeric(&mut buffer, val);
+                                        } else {
+                                            // Fallback: if declared type Int64 but accessor failed
+                                            use otap_df_pdata::views::common::ValueType as VT;
+                                            if value.value_type() == VT::Int64 {
+                                                eprintln!("  ⚠️  Int64 accessor None for {}, writing 0", field.name);
+                                                BondWriter::write_numeric(&mut buffer, 0i64);
+                                            } else {
+                                                eprintln!("  ⚠️  Int64 mismatch for {}, writing 0", field.name);
+                                                BondWriter::write_numeric(&mut buffer, 0i64);
+                                            }
+                                        }
                                     }
-                                }
-                                3 => {
-                                    if let Some(double_arr) = attrs.anyval_arrays.attr_double {
-                                        if !double_arr.is_null(*attr_index) {
-                                            let val = double_arr.value(*attr_index);
+                                    BondDataType::BT_DOUBLE => {
+                                        if let Some(val) = value.as_double() {
                                             eprintln!("  📝 [LOG_ATTR:double] {} = {}", field.name, val);
                                             BondWriter::write_numeric(&mut buffer, val);
+                                        } else {
+                                            eprintln!("  ⚠️  Double accessor None for {}, writing 0.0", field.name);
+                                            BondWriter::write_numeric(&mut buffer, 0f64);
                                         }
                                     }
-                                }
-                                4 => {
-                                    if let Some(bool_arr) = attrs.anyval_arrays.attr_bool {
-                                        if !bool_arr.is_null(*attr_index) {
-                                            let val = bool_arr.value(*attr_index);
+                                    BondDataType::BT_BOOL => {
+                                        if let Some(val) = value.as_bool() {
                                             eprintln!("  📝 [LOG_ATTR:bool] {} = {}", field.name, val);
                                             BondWriter::write_bool(&mut buffer, val);
+                                        } else {
+                                            // Handle status_code mis-typed as Bool but actually numeric: try int64/string fallback
+                                            if let Some(int_candidate) = value.as_int64() {
+                                                eprintln!("  ⚠️  Bool accessor None but int64 present for {}, coercing {}", field.name, int_candidate);
+                                                BondWriter::write_numeric(&mut buffer, int_candidate);
+                                            } else if let Some(str_bytes) = value.as_string() {
+                                                if let Ok(s) = std::str::from_utf8(str_bytes) {
+                                                    if let Ok(parsed) = s.parse::<i64>() {
+                                                        eprintln!("  ⚠️  Bool accessor None; parsed numeric string {} for {}", parsed, field.name);
+                                                        BondWriter::write_numeric(&mut buffer, parsed);
+                                                    } else {
+                                                        eprintln!("  ⚠️  Bool accessor None; writing false default for {}", field.name);
+                                                        BondWriter::write_bool(&mut buffer, false);
+                                                    }
+                                                } else {
+                                                    eprintln!("  ⚠️  Bool accessor None; invalid UTF8 string, writing false for {}", field.name);
+                                                    BondWriter::write_bool(&mut buffer, false);
+                                                }
+                                            } else {
+                                                eprintln!("  ⚠️  Bool accessor None; writing false default for {}", field.name);
+                                                BondWriter::write_bool(&mut buffer, false);
+                                            }
                                         }
                                     }
+                                    _ => {
+                                        eprintln!("  ⚠️  Skipping unexpected Bond type {:?} for key {}", bond_type, field.name);
+                                    }
                                 }
-                                other => {
-                                    eprintln!(
-                                        "  ⚠️  Unsupported attribute type code {} for key {}",
-                                        other, field.name
-                                    );
+                            } else {
+                                eprintln!("  ⚠️  Attribute '{}' has no value (writing default)", field.name);
+                                match bond_type {
+                                    BondDataType::BT_STRING => BondWriter::write_string(&mut buffer, ""),
+                                    BondDataType::BT_INT64 => BondWriter::write_numeric(&mut buffer, 0i64),
+                                    BondDataType::BT_DOUBLE => BondWriter::write_numeric(&mut buffer, 0f64),
+                                    BondDataType::BT_BOOL => BondWriter::write_bool(&mut buffer, false),
+                                    _ => {}
                                 }
                             }
-                        } else if row_idx < 2 {
-                            eprintln!(
-                                "    ❌ Attribute '{}' not found for this log row",
-                                field.name
-                            );
                         }
-                    } else if row_idx < 2 {
-                        eprintln!("    ❌ No attributes for log");
+                    } else {
+                        // Field declared in schema but not discoverable in row_attrs (e.g., probes failed). Attempt fallback by scanning attributes.
+                        eprintln!("    ⚠️ Attribute '{}' not in row_attrs; attempting fallback", field.name);
+                        let mut wrote = false;
+                        for a in log.attributes() {
+                            if let Ok(k) = std::str::from_utf8(a.key()) {
+                                if k == field.name {
+                                    if let Some(v) = a.value() {
+                                        use otap_df_pdata::views::common::ValueType as VT;
+                                        match v.value_type() {
+                                            VT::String => {
+                                                if let Some(bytes) = v.as_string() {
+                                                    if let Ok(s) = std::str::from_utf8(bytes) {
+                                                        BondWriter::write_string(&mut buffer, s);
+                                                        wrote = true;
+                                                    }
+                                                }
+                                                if !wrote {
+                                                    BondWriter::write_string(&mut buffer, "");
+                                                    wrote = true;
+                                                }
+                                            }
+                                            VT::Int64 => {
+                                                if let Some(i) = v.as_int64() {
+                                                    BondWriter::write_numeric(&mut buffer, i);
+                                                } else {
+                                                    BondWriter::write_numeric(&mut buffer, 0i64);
+                                                }
+                                                wrote = true;
+                                            }
+                                            VT::Double => {
+                                                if let Some(d) = v.as_double() {
+                                                    BondWriter::write_numeric(&mut buffer, d);
+                                                } else {
+                                                    BondWriter::write_numeric(&mut buffer, 0f64);
+                                                }
+                                                wrote = true;
+                                            }
+                                            VT::Bool => {
+                                                if let Some(b) = v.as_bool() {
+                                                    BondWriter::write_bool(&mut buffer, b);
+                                                    wrote = true;
+                                                } else if let Some(i) = v.as_int64() {
+                                                    eprintln!("    ⚠️ Coercing fallback Bool->Int64 for '{}' value {}", field.name, i);
+                                                    BondWriter::write_numeric(&mut buffer, i);
+                                                    wrote = true;
+                                                } else if let Some(bytes) = v.as_string() {
+                                                    if let Ok(s) = std::str::from_utf8(bytes) {
+                                                        if let Ok(parsed) = s.parse::<i64>() {
+                                                            eprintln!("    ⚠️ Coercing fallback Bool->parsed Int64 for '{}' value {}", field.name, parsed);
+                                                            BondWriter::write_numeric(&mut buffer, parsed);
+                                                            wrote = true;
+                                                        }
+                                                    }
+                                                }
+                                                if !wrote {
+                                                    BondWriter::write_bool(&mut buffer, false);
+                                                    wrote = true;
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        if !wrote {
+                            eprintln!("    ⚠️ Writing default for missing '{}'", field.name);
+                            // Write default based on heuristic: treat unknown as string empty
+                            BondWriter::write_string(&mut buffer, "");
+                        }
                     }
                 }
             }
         }
 
-        eprintln!("  ✅ Row {} encoded ({} bytes)", row_idx, buffer.len());
+        eprintln!("  ✅ Row encoded ({} bytes)", buffer.len());
         buffer
     }
 
@@ -800,7 +1032,7 @@ mod tests {
             .unwrap();
 
         // Encode with Arrow encoder
-        let mut arrow_encoder = ArrowLogEncoder::new();
+        let arrow_encoder = ArrowLogEncoder::new();  // ✅ No longer need mut!
         let (logs_batch, attrs_batch) = create_test_arrow_batch();
         let arrow_result = arrow_encoder
             .encode_arrow_batch(&logs_batch, Some(&attrs_batch), None, metadata)

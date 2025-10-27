@@ -32,6 +32,8 @@ azure_core = "0.27.0"
 tracing = "0.1"
 # otel-arrow-rust for zero-copy Arrow iteration utilities
 otel-arrow-rust = { path = "../../../otel-arrow/rust/otel-arrow-rust" }
+# otap-df-pdata for view trait abstractions
+otap-df-pdata = { path = "../../../otel-arrow/rust/otap-dataflow/crates/pdata" }
 
 [features]
 self_signed_certs = [] # Empty by default for security
