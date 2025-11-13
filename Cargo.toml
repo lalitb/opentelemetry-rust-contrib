@@ -20,6 +20,11 @@ members = [
     "stress",
 ]
 
+exclude = [
+    "otel-config-2",
+    "otel-config-2-custom-exporter",
+]
+
 resolver = "2"
 
 [profile.bench]
