@@ -1,0 +1,20 @@
+[package]
+name = "otel-config-2"
+version = "0.1.0"
+description = "Simplified declarative configuration for OpenTelemetry SDK"
+edition = "2021"
+rust-version = "1.75.0"
+license = "Apache-2.0"
+
+[dependencies]
+opentelemetry = { version = "0.31.0" }
+opentelemetry_sdk = { version = "0.31.0", features = ["rt-tokio"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = { version = "0.9.34" }
+thiserror = "1.0"
+
+[dev-dependencies]
+opentelemetry-stdout = { version = "0.31.0" }
+
+# This is a standalone crate, not part of the workspace
+[workspace]

@@ -1,0 +1,26 @@
+[package]
+name = "custom-exporter-guide"
+version = "0.1.0"
+edition = "2021"
+
+[[example]]
+name = "basic-example"
+path = "basic-example.rs"
+
+[[example]]
+name = "multiple-exporters-example"
+path = "multiple-exporters-example.rs"
+
+[[example]]
+name = "advanced-example"
+path = "advanced-example.rs"
+
+[dependencies]
+otel-config-2 = { path = "../../otel-config-2" }
+otel-config-2-custom-exporter = { path = "../../otel-config-2-custom-exporter" }
+opentelemetry = "0.27"
+opentelemetry_sdk = "0.27"
+opentelemetry-stdout = { version = "0.27", features = ["metrics"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+tokio = { version = "1.0", features = ["full"] }

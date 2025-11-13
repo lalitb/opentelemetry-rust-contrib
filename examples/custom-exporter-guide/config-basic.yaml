@@ -1,0 +1,16 @@
+# Basic configuration for custom exporter
+# This is the minimal setup needed to use a custom exporter
+
+metrics:
+  readers:
+    - periodic:
+        interval_millis: 5000
+        exporter:
+          custom:
+            endpoint: "http://localhost:8080/metrics"
+            timeout_secs: 30
+            debug: true
+
+resource:
+  service.name: "basic-example"
+  service.version: "1.0.0"

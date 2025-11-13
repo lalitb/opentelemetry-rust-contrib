@@ -1,0 +1,58 @@
+# Advanced production-like configuration
+# Demonstrates rich resource attributes, multiple exporters, and different intervals
+
+metrics:
+  readers:
+    # Console exporter for debugging - short interval
+    - periodic:
+        interval_millis: 3000
+        exporter:
+          console:
+            temporality: cumulative
+            pretty_print: true
+
+    # Custom exporter for production - longer interval
+    - periodic:
+        interval_millis: 10000
+        exporter:
+          custom:
+            endpoint: "https://metrics.example.com/api/v1/metrics"
+            timeout_secs: 60
+            batch_size: 1024
+            custom_header: "X-API-Key: production-secret-key"
+            temporality: delta
+            debug: false
+
+# Rich resource attributes following OpenTelemetry semantic conventions
+resource:
+  # Service identification
+  service.name: "advanced-example-service"
+  service.version: "2.1.0"
+  service.namespace: "production"
+  service.instance.id: "instance-abc-123"
+  
+  # Deployment information
+  deployment.environment: "production"
+  deployment.region: "us-west-2"
+  deployment.zone: "us-west-2a"
+  
+  # Host information
+  host.name: "app-server-01"
+  host.type: "kubernetes"
+  
+  # Cloud provider information
+  cloud.provider: "aws"
+  cloud.platform: "aws_eks"
+  cloud.region: "us-west-2"
+  cloud.availability_zone: "us-west-2a"
+  
+  # Kubernetes information
+  k8s.cluster.name: "production-cluster"
+  k8s.namespace.name: "default"
+  k8s.pod.name: "advanced-example-pod-xyz"
+  k8s.deployment.name: "advanced-example"
+  
+  # Custom business attributes
+  team: "platform-team"
+  cost_center: "engineering"
+  application: "api-gateway"

@@ -1,0 +1,31 @@
+# Example configuration using multiple exporters
+# This demonstrates how easy it is to configure multiple exporters,
+# including custom ones from external crates.
+
+metrics:
+  readers:
+    # First reader: Console exporter (for debugging)
+    - periodic:
+        interval_millis: 3000
+        exporter:
+          console:
+            temporality: cumulative
+
+    # Second reader: Custom exporter (your custom implementation)
+    - periodic:
+        interval_millis: 5000
+        exporter:
+          custom:
+            endpoint: "http://localhost:8080/metrics"
+            timeout_secs: 30
+            batch_size: 512
+            custom_header: "X-API-Key: demo-secret-key"
+            temporality: delta
+            debug: true
+
+# Resource attributes (attached to all metrics)
+resource:
+  service.name: "custom-exporter-demo"
+  service.version: "1.0.0"
+  deployment.environment: "demo"
+  team: "platform"

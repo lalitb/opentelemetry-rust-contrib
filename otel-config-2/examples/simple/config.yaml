@@ -1,0 +1,17 @@
+# Example OpenTelemetry configuration
+# This demonstrates the simple, clean configuration format
+
+metrics:
+  readers:
+    - periodic:
+        interval_millis: 5000
+        timeout_millis: 1000
+        exporter:
+          console:
+            temporality: cumulative
+
+resource:
+  service.name: "example-service"
+  service.version: "1.0.0"
+  deployment.environment: "development"
+  replica.count: 1
