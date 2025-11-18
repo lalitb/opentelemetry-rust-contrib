@@ -14,7 +14,6 @@ use tracing::{debug, error};
 
 #[cfg(feature = "pdata-views")]
 use otap_df_pdata::views::{
-    common::Str,
     logs::{LogRecordView, LogsDataView, ResourceLogsView, ScopeLogsView},
 };
 
