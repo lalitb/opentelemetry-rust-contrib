@@ -11,6 +11,7 @@ license = "Apache-2.0"
 
 [dependencies]
 opentelemetry-proto = {workspace = true, default-features = false, features = ["logs", "trace", "gen-tonic-messages"]}
+otap-df-pdata = { path = "../../../otel-arrow/rust/otap-dataflow/crates/pdata", optional = true }
 base64 = "0.22"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["raw_value"] }
@@ -32,7 +33,8 @@ tracing = "0.1"
 
 [features]
 self_signed_certs = [] # Empty by default for security
-mock_auth = [] # Disabled by default. Not to be enabled in the prod release. 
+mock_auth = [] # Disabled by default. Not to be enabled in the prod release.
+pdata-views = ["otap-df-pdata"] # Enable support for zero-copy pdata views
 default = ["self_signed_certs"] # TODO - remove this feature before release
 
 [dev-dependencies]

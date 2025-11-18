@@ -208,6 +208,34 @@ impl GenevaClient {
             })
     }
 
+    /// Encode logs from a zero-copy pdata view into LZ4 chunked compressed batches.
+    /// This method avoids OTAP → OTLP conversion and works directly with Arrow columnar data.
+    ///
+    /// Requires the `pdata-views` feature to be enabled.
+    #[cfg(feature = "pdata-views")]
+    pub fn encode_and_compress_logs_view<'a>(
+        &self,
+        logs_view: &'a impl otap_df_pdata::views::logs::LogsDataView,
+    ) -> Result<Vec<EncodedBatch>, String> {
+        debug!(
+            name: "client.encode_and_compress_logs_view",
+            target: "geneva-uploader",
+            "Encoding and compressing logs from pdata view"
+        );
+
+        self.encoder
+            .encode_log_batch_view(logs_view, &self.metadata_fields)
+            .map_err(|e| {
+                debug!(
+                    name: "client.encode_and_compress_logs_view.error",
+                    target: "geneva-uploader",
+                    error = %e,
+                    "Log compression failed"
+                );
+                format!("Compression failed: {e}")
+            })
+    }
+
     /// Upload a single compressed batch.
     /// This allows for granular control over uploads, including custom retry logic for individual batches.
     pub async fn upload_batch(&self, batch: &EncodedBatch) -> Result<(), String> {

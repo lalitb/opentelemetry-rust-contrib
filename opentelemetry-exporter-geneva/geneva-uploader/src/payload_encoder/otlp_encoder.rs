@@ -12,6 +12,12 @@ use std::borrow::Cow;
 use std::sync::Arc;
 use tracing::{debug, error};
 
+#[cfg(feature = "pdata-views")]
+use otap_df_pdata::views::{
+    common::Str,
+    logs::{LogRecordView, LogsDataView, ResourceLogsView, ScopeLogsView},
+};
+
 const FIELD_ENV_NAME: &str = "env_name";
 const FIELD_ENV_VER: &str = "env_ver";
 const FIELD_TIMESTAMP: &str = "timestamp";
@@ -260,6 +266,182 @@ impl OtlpEncoder {
                 row_count: events_count,
             });
         }
+        Ok(blobs)
+    }
+
+    /// Encode logs from a pdata view into LZ4 chunked compressed batches.
+    /// This method works directly with view traits, avoiding OTAP → OTLP conversion.
+    ///
+    /// # Arguments
+    /// * `logs_view` - Zero-copy view over OTAP Arrow columnar data
+    /// * `metadata_fields` - Geneva metadata fields
+    ///
+    /// # Returns
+    /// Vector of encoded batches, one per event_name, with LZ4 compression applied
+    #[cfg(feature = "pdata-views")]
+    pub(crate) fn encode_log_batch_view<'a>(
+        &self,
+        logs_view: &'a impl LogsDataView,
+        metadata_fields: &MetadataFields,
+    ) -> Result<Vec<EncodedBatch>, String> {
+        use std::collections::HashMap;
+
+        // Internal struct to accumulate batch data before encoding
+        struct BatchData {
+            schemas: Vec<CentralSchemaEntry>,
+            events: Vec<CentralEventEntry>,
+            metadata: BatchMetadata,
+        }
+
+        impl BatchData {
+            fn format_schema_ids(&self) -> String {
+                use std::fmt::Write;
+
+                if self.schemas.is_empty() {
+                    return String::new();
+                }
+
+                let estimated_capacity =
+                    self.schemas.len() * 32 + self.schemas.len().saturating_sub(1);
+
+                self.schemas.iter().enumerate().fold(
+                    String::with_capacity(estimated_capacity),
+                    |mut acc, (i, s)| {
+                        if i > 0 {
+                            acc.push(';');
+                        }
+                        let _ = write!(&mut acc, "{:x}", md5::Digest(s.md5));
+                        acc
+                    },
+                )
+            }
+        }
+
+        let mut batches: HashMap<String, BatchData> = HashMap::new();
+
+        // Iterate using view traits
+        for resource_logs in logs_view.resources() {
+            for scope_logs in resource_logs.scopes() {
+                for log_record in scope_logs.log_records() {
+                    // Get timestamp
+                    let timestamp = log_record
+                        .time_unix_nano()
+                        .or_else(|| log_record.observed_time_unix_nano())
+                        .unwrap_or(0);
+
+                    // Get event name
+                    let event_name_str = log_record
+                        .event_name()
+                        .and_then(|s| std::str::from_utf8(s).ok())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("Log");
+
+                    // Determine fields from view
+                    let field_info = Self::determine_fields_from_view(&log_record, event_name_str);
+
+                    // Get or create batch entry
+                    let entry =
+                        batches
+                            .entry(event_name_str.to_string())
+                            .or_insert_with(|| BatchData {
+                                schemas: Vec::new(),
+                                events: Vec::new(),
+                                metadata: BatchMetadata {
+                                    start_time: timestamp,
+                                    end_time: timestamp,
+                                    schema_ids: String::new(),
+                                },
+                            });
+
+                    // Update timestamp range
+                    if timestamp != 0 {
+                        entry.metadata.start_time = entry.metadata.start_time.min(timestamp);
+                        entry.metadata.end_time = entry.metadata.end_time.max(timestamp);
+                    }
+
+                    // Find or create schema
+                    let schema_id = match entry.schemas.iter().position(|s| {
+                        s.fields.len() == field_info.len()
+                            && s.fields
+                                .iter()
+                                .zip(&field_info)
+                                .rev()
+                                .all(|(a, b)| a.type_id == b.type_id && a.name == b.name)
+                    }) {
+                        Some(idx) => (idx + 1) as u64,
+                        None => {
+                            let new_id = (entry.schemas.len() + 1) as u64;
+                            let schema_entry = Self::create_schema(new_id, &field_info);
+                            entry.schemas.push(schema_entry);
+                            new_id
+                        }
+                    };
+
+                    // Encode row using view
+                    let row_buffer =
+                        self.write_row_data_from_view(&log_record, &field_info, metadata_fields);
+                    let level = log_record.severity_number().unwrap_or(0) as u8;
+
+                    // Create event entry
+                    let central_event = CentralEventEntry {
+                        schema_id,
+                        level,
+                        event_name: Arc::new(event_name_str.to_string()),
+                        row: row_buffer,
+                    };
+                    entry.events.push(central_event);
+                }
+            }
+        }
+
+        // Encode blobs (one per event_name)
+        let mut blobs = Vec::with_capacity(batches.len());
+        for (batch_event_name, mut batch_data) in batches {
+            let schema_ids_string = batch_data.format_schema_ids();
+            batch_data.metadata.schema_ids = schema_ids_string;
+
+            let schemas_count = batch_data.schemas.len();
+            let events_count = batch_data.events.len();
+
+            let blob = CentralBlob {
+                version: 1,
+                format: 2,
+                metadata: metadata_fields.metadata_string().to_owned(),
+                schemas: batch_data.schemas,
+                events: batch_data.events,
+            };
+
+            let uncompressed = blob.to_bytes();
+            let compressed = lz4_chunked_compression(&uncompressed).map_err(|e| {
+                debug!(
+                    name: "encoder.encode_log_batch_view.compress_error",
+                    target: "geneva-uploader",
+                    event_name = %batch_event_name,
+                    error = %e,
+                    "LZ4 compression failed"
+                );
+                format!("compression failed: {e}")
+            })?;
+
+            debug!(
+                name: "encoder.encode_log_batch_view",
+                target: "geneva-uploader",
+                event_name = %batch_event_name,
+                schemas = schemas_count,
+                events = events_count,
+                uncompressed_size = uncompressed.len(),
+                compressed_size = compressed.len(),
+                "Encoded log batch from view"
+            );
+
+            blobs.push(EncodedBatch {
+                event_name: batch_event_name,
+                data: compressed,
+                metadata: batch_data.metadata,
+                row_count: events_count,
+            });
+        }
+
         Ok(blobs)
     }
 
@@ -866,6 +1048,160 @@ impl OtlpEncoder {
                 _ => {} // TODO - handle more types
             }
         }
+    }
+
+    // ===== View-based helper methods =====
+
+    /// Determine fields from a LogRecordView (view-based version)
+    #[cfg(feature = "pdata-views")]
+    fn determine_fields_from_view<T: LogRecordView>(log: &T, _event_name: &str) -> Vec<FieldDef> {
+        // For now, use a simplified field set - TODO: handle attributes properly
+        let mut fields = Vec::with_capacity(10);
+
+        // Helper to push field with auto-incrementing field_id
+        let mut push_field = |name: &'static str, type_id: BondDataType| {
+            fields.push(FieldDef {
+                name: Cow::Borrowed(name),
+                field_id: (fields.len() + 1) as u16,
+                type_id,
+            });
+        };
+
+        // Always present fields
+        push_field(FIELD_ENV_NAME, BondDataType::BT_STRING);
+        push_field(FIELD_ENV_VER, BondDataType::BT_STRING);
+        push_field(FIELD_TIMESTAMP, BondDataType::BT_INT64);
+        push_field(FIELD_ENV_TIME, BondDataType::BT_STRING);
+
+        // Tenant/Role/RoleInstance
+        push_field(FIELD_TENANT, BondDataType::BT_STRING);
+        push_field(FIELD_ROLE, BondDataType::BT_STRING);
+        push_field(FIELD_ROLE_INSTANCE, BondDataType::BT_STRING);
+
+        // Conditional fields based on presence
+        if log.trace_id().is_some() {
+            push_field(FIELD_TRACE_ID, BondDataType::BT_STRING);
+        }
+        if log.span_id().is_some() {
+            push_field(FIELD_SPAN_ID, BondDataType::BT_STRING);
+        }
+        if log.flags().is_some() {
+            push_field(FIELD_TRACE_FLAGS, BondDataType::BT_UINT32);
+        }
+        if log.event_name().is_some() {
+            push_field(FIELD_NAME, BondDataType::BT_STRING);
+        }
+        if log.severity_number().is_some() {
+            push_field(FIELD_SEVERITY_NUMBER, BondDataType::BT_INT32);
+        }
+        if log.severity_text().is_some() {
+            push_field(FIELD_SEVERITY_TEXT, BondDataType::BT_STRING);
+        }
+        if log.body().is_some() {
+            push_field(FIELD_BODY, BondDataType::BT_STRING);
+        }
+
+        // TODO: Add dynamic attributes iteration when attribute support is complete
+
+        fields
+    }
+
+    /// Write row data from a LogRecordView (view-based version)
+    #[cfg(feature = "pdata-views")]
+    fn write_row_data_from_view<T: LogRecordView>(
+        &self,
+        log: &T,
+        sorted_fields: &[FieldDef],
+        metadata_fields: &MetadataFields,
+    ) -> Vec<u8> {
+        let mut buffer = Vec::with_capacity(512);
+
+        for field in sorted_fields {
+            match field.name.as_ref() {
+                FIELD_ENV_NAME => {
+                    BondWriter::write_string(&mut buffer, &metadata_fields.env_name);
+                }
+                FIELD_ENV_VER => {
+                    BondWriter::write_string(&mut buffer, &metadata_fields.env_ver);
+                }
+                FIELD_TIMESTAMP => {
+                    let timestamp = log
+                        .time_unix_nano()
+                        .or_else(|| log.observed_time_unix_nano())
+                        .unwrap_or(0);
+                    BondWriter::write_numeric(&mut buffer, timestamp as i64);
+                }
+                FIELD_ENV_TIME => {
+                    let timestamp = log
+                        .time_unix_nano()
+                        .or_else(|| log.observed_time_unix_nano())
+                        .unwrap_or(0);
+
+                    if timestamp != 0 {
+                        let nanos = (timestamp % 1_000_000_000) as i64;
+                        let secs = (timestamp / 1_000_000_000) as i64;
+                        let dt = Utc.timestamp_opt(secs, nanos as u32).single();
+                        if let Some(dt) = dt {
+                            let formatted = dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+                            BondWriter::write_string(&mut buffer, &formatted);
+                        }
+                    }
+                }
+                FIELD_TENANT => {
+                    BondWriter::write_string(&mut buffer, &metadata_fields.tenant);
+                }
+                FIELD_ROLE => {
+                    BondWriter::write_string(&mut buffer, &metadata_fields.role);
+                }
+                FIELD_ROLE_INSTANCE => {
+                    BondWriter::write_string(&mut buffer, &metadata_fields.role_instance);
+                }
+                FIELD_TRACE_ID => {
+                    // TODO: Implement proper trace_id hex encoding from view
+                    // For now, write empty string
+                    BondWriter::write_string(&mut buffer, "");
+                }
+                FIELD_SPAN_ID => {
+                    // TODO: Implement proper span_id hex encoding from view
+                    // For now, write empty string
+                    BondWriter::write_string(&mut buffer, "");
+                }
+                FIELD_TRACE_FLAGS => {
+                    if let Some(flags) = log.flags() {
+                        BondWriter::write_numeric(&mut buffer, flags);
+                    }
+                }
+                FIELD_NAME => {
+                    if let Some(event_name) = log.event_name() {
+                        if let Ok(name_str) = std::str::from_utf8(event_name) {
+                            BondWriter::write_string(&mut buffer, name_str);
+                        }
+                    }
+                }
+                FIELD_SEVERITY_NUMBER => {
+                    if let Some(severity) = log.severity_number() {
+                        BondWriter::write_numeric(&mut buffer, severity);
+                    }
+                }
+                FIELD_SEVERITY_TEXT => {
+                    if let Some(severity_text) = log.severity_text() {
+                        if let Ok(text_str) = std::str::from_utf8(severity_text) {
+                            BondWriter::write_string(&mut buffer, text_str);
+                        }
+                    }
+                }
+                FIELD_BODY => {
+                    // TODO: Handle body from view when AnyValueView is fully implemented
+                    // For now, write empty string
+                    BondWriter::write_string(&mut buffer, "");
+                }
+                _ => {
+                    // TODO: Handle dynamic attributes when attribute iteration is implemented
+                }
+            }
+        }
+
+        buffer
     }
 }
 
