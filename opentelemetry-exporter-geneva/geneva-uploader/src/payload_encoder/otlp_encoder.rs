@@ -13,9 +13,7 @@ use std::sync::Arc;
 use tracing::{debug, error};
 
 #[cfg(feature = "pdata-views")]
-use otap_df_pdata::views::{
-    logs::{LogRecordView, LogsDataView, ResourceLogsView, ScopeLogsView},
-};
+use otap_df_pdata::views::logs::{LogRecordView, LogsDataView, ResourceLogsView, ScopeLogsView};
 
 const FIELD_ENV_NAME: &str = "env_name";
 const FIELD_ENV_VER: &str = "env_ver";
@@ -339,18 +337,17 @@ impl OtlpEncoder {
                     let field_info = Self::determine_fields_from_view(&log_record, event_name_str);
 
                     // Get or create batch entry
-                    let entry =
-                        batches
-                            .entry(event_name_str.to_string())
-                            .or_insert_with(|| BatchData {
-                                schemas: Vec::new(),
-                                events: Vec::new(),
-                                metadata: BatchMetadata {
-                                    start_time: timestamp,
-                                    end_time: timestamp,
-                                    schema_ids: String::new(),
-                                },
-                            });
+                    let entry = batches
+                        .entry(event_name_str.to_string())
+                        .or_insert_with(|| BatchData {
+                            schemas: Vec::new(),
+                            events: Vec::new(),
+                            metadata: BatchMetadata {
+                                start_time: timestamp,
+                                end_time: timestamp,
+                                schema_ids: String::new(),
+                            },
+                        });
 
                     // Update timestamp range
                     if timestamp != 0 {
