@@ -190,20 +190,24 @@ impl AzureArcManagedIdentityCredential {
                 .unwrap_or("<unavailable default tokens dir>"),
         )?;
 
-        let secret = fs::read(&secret_path).with_context(ErrorKind::Credential, || {
-            format!("Azure Arc failed to read secret file '{}'", secret_path)
+        // Guard file size before reading to avoid excessive allocation.
+        let metadata = fs::metadata(&secret_path).with_context(ErrorKind::Credential, || {
+            format!("Azure Arc failed to stat secret file '{}'", secret_path)
         })?;
-
-        if secret.len() as u64 > ARC_MAX_FILE_SIZE {
+        if metadata.len() > ARC_MAX_FILE_SIZE {
             return Err(Error::message(
                 ErrorKind::Credential,
                 format!(
                     "Azure Arc secret file too large ({} bytes, max {})",
-                    secret.len(),
+                    metadata.len(),
                     ARC_MAX_FILE_SIZE
                 ),
             ));
         }
+
+        let secret = fs::read(&secret_path).with_context(ErrorKind::Credential, || {
+            format!("Azure Arc failed to read secret file '{}'", secret_path)
+        })?;
 
         // Phase 2: authorized request with secret
         let url2 = url;
