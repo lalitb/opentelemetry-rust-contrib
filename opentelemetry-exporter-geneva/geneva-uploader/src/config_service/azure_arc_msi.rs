@@ -83,8 +83,8 @@ impl AzureArcManagedIdentityCredential {
     /// * `AZURE_IDENTITY_ARC_TOKENS_DIR` - Optional override for tokens directory (for testing)
     pub fn new(http_client: Arc<dyn HttpClient>) -> Result<Self> {
         // Use IDENTITY_ENDPOINT if provided, else default constant (mirrors MSAL behavior)
-        let endpoint = std::env::var("IDENTITY_ENDPOINT")
-            .unwrap_or_else(|_| DEFAULT_ENDPOINT.to_string());
+        let endpoint =
+            std::env::var("IDENTITY_ENDPOINT").unwrap_or_else(|_| DEFAULT_ENDPOINT.to_string());
         let endpoint = Url::parse(&endpoint).with_context(ErrorKind::Credential, || {
             format!("Azure Arc endpoint must be a valid URL, got '{endpoint}'")
         })?;
@@ -155,10 +155,13 @@ impl AzureArcManagedIdentityCredential {
                     format!("Azure Arc challenge expected HTTP 401, received {}", status),
                 ));
             }
-            return Err(Error::with_message(
-                ErrorKind::Credential,
-                || format!("Azure Arc request failed with status {}: {}", status, String::from_utf8_lossy(&bytes))
-            ));
+            return Err(Error::with_message(ErrorKind::Credential, || {
+                format!(
+                    "Azure Arc request failed with status {}: {}",
+                    status,
+                    String::from_utf8_lossy(&bytes)
+                )
+            }));
         }
 
         let www_auth = headers
@@ -215,10 +218,13 @@ impl AzureArcManagedIdentityCredential {
         let (status2, _, body2) = rsp2.deconstruct();
         let body2 = body2.collect().await?;
         if !status2.is_success() {
-            return Err(Error::with_message(
-                ErrorKind::Credential,
-                || format!("Azure Arc token request failed with status {}: {}", status2, String::from_utf8_lossy(&body2))
-            ));
+            return Err(Error::with_message(ErrorKind::Credential, || {
+                format!(
+                    "Azure Arc token request failed with status {}: {}",
+                    status2,
+                    String::from_utf8_lossy(&body2)
+                )
+            }));
         }
 
         let token_response: ArcTokenResponse = from_json(&body2)
@@ -474,21 +480,20 @@ mod tests {
         unsafe { std::env::set_var(ARC_TOKENS_DIR_OVERRIDE, base_dir.to_string_lossy().as_ref()) };
 
         // Valid path should succeed
-        let result = validate_arc_secret_path(
-            &secret_path.to_string_lossy(),
-            &base_dir.to_string_lossy(),
-        );
+        let result =
+            validate_arc_secret_path(&secret_path.to_string_lossy(), &base_dir.to_string_lossy());
         assert!(result.is_ok());
 
         // Invalid extension should fail
         let bad_path = base_dir.join("test.txt");
         std::fs::File::create(&bad_path).unwrap();
-        let result = validate_arc_secret_path(
-            &bad_path.to_string_lossy(),
-            &base_dir.to_string_lossy(),
-        );
+        let result =
+            validate_arc_secret_path(&bad_path.to_string_lossy(), &base_dir.to_string_lossy());
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("must have .key extension"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("must have .key extension"));
 
         // Cleanup
         unsafe { std::env::remove_var(ARC_TOKENS_DIR_OVERRIDE) };
