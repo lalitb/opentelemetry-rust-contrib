@@ -8,8 +8,12 @@ pub mod client;
 mod bench;
 
 #[allow(unused_imports)]
+pub(crate) use config_service::azure_arc_msi::AzureArcManagedIdentityCredential;
+
+#[allow(unused_imports)]
 pub(crate) use config_service::client::{
     GenevaConfigClient, GenevaConfigClientConfig, GenevaConfigClientError, IngestionGatewayInfo,
+    MonikerInfo,
 };
 
 #[allow(unused_imports)]

@@ -1,3 +1,4 @@
+pub(crate) mod azure_arc_msi;
 pub(crate) mod client;
 
 #[cfg(test)]
@@ -33,6 +34,27 @@ mod tests {
             AuthMethod::WorkloadIdentity { .. } => {}
             _ => panic!("expected WorkloadIdentity variant"),
         }
+    }
+
+    #[test]
+    fn test_config_fields_azure_arc() {
+        let config = GenevaConfigClientConfig {
+            endpoint: "https://example.com".to_string(),
+            environment: "env".to_string(),
+            account: "acct".to_string(),
+            namespace: "ns".to_string(),
+            region: "region".to_string(),
+            config_major_version: 1,
+            auth_method: AuthMethod::AzureArcManagedIdentity,
+            msi_resource: None,
+        };
+
+        assert_eq!(config.environment, "env");
+        assert_eq!(config.account, "acct");
+        assert!(matches!(
+            config.auth_method,
+            AuthMethod::AzureArcManagedIdentity
+        ));
     }
 
     fn generate_self_signed_p12() -> (NamedTempFile, String) {
