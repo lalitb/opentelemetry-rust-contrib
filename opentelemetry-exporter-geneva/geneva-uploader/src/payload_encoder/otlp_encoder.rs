@@ -112,6 +112,7 @@ impl OtlpEncoder {
             schemas: Vec<CentralSchemaEntry>,
             events: Vec<CentralEventEntry>,
             metadata: BatchMetadata,
+            row_data: Vec<u8>,
         }
 
         impl BatchData {
@@ -170,6 +171,7 @@ impl OtlpEncoder {
                     end_time: timestamp,
                     schema_ids: String::new(),
                 },
+                row_data: Vec::new(),
             });
 
             // Update timestamp range
@@ -200,16 +202,24 @@ impl OtlpEncoder {
                 }
             };
 
-            // 4. Encode row
-            let row_buffer = self.write_row_data(log_record, &field_info, metadata_fields);
+            // 4. Encode row directly into the batch's shared row_data buffer
+            let row_offset = entry.row_data.len();
+            self.write_row_data(
+                log_record,
+                &field_info,
+                metadata_fields,
+                &mut entry.row_data,
+            );
+            let row_len = entry.row_data.len() - row_offset;
             let level = log_record.severity_number as u8;
 
-            // 5. Create CentralEventEntry directly (optimization: no intermediate EncodedRow)
+            // 5. Create CentralEventEntry referencing the shared buffer
             let central_event = CentralEventEntry {
                 schema_id,
                 level,
                 event_name: Arc::new(event_name_str.to_string()),
-                row: row_buffer,
+                row_offset,
+                row_len,
             };
             entry.events.push(central_event);
         }
@@ -229,6 +239,7 @@ impl OtlpEncoder {
                 metadata: metadata_fields.metadata_string().to_owned(),
                 schemas: batch_data.schemas,
                 events: batch_data.events,
+                row_data: batch_data.row_data,
             };
             let uncompressed = blob.to_bytes();
             let compressed = lz4_chunked_compression(&uncompressed).map_err(|e| {
@@ -280,6 +291,7 @@ impl OtlpEncoder {
 
         let mut schemas = Vec::new();
         let mut events = Vec::new();
+        let mut row_data = Vec::new();
         let mut start_time = u64::MAX;
         let mut end_time = 0u64;
 
@@ -317,16 +329,19 @@ impl OtlpEncoder {
                 }
             };
 
-            // 4. Encode row
-            let row_buffer = self.write_span_row_data(span, &field_info, metadata_fields);
+            // 4. Encode row directly into the shared row_data buffer
+            let row_offset = row_data.len();
+            self.write_span_row_data(span, &field_info, metadata_fields, &mut row_data);
+            let row_len = row_data.len() - row_offset;
             let level = 5; // Default level for spans (INFO equivalent)
 
-            // 5. Create CentralEventEntry
+            // 5. Create CentralEventEntry referencing the shared buffer
             let central_event = CentralEventEntry {
                 schema_id,
                 level,
                 event_name: Arc::new(EVENT_NAME.to_string()),
-                row: row_buffer,
+                row_offset,
+                row_len,
             };
             events.push(central_event);
         }
@@ -379,6 +394,7 @@ impl OtlpEncoder {
             metadata: metadata_fields.metadata_string().to_owned(),
             schemas,
             events,
+            row_data,
         };
 
         let uncompressed = blob.to_bytes();
@@ -587,36 +603,35 @@ impl OtlpEncoder {
         }
     }
 
-    /// Write span row data directly from Span
+    /// Write span row data directly from Span, appending to the provided buffer.
     // TODO - code duplication between write_span_row_data() and write_row_data() - consider extracting common field handling
     fn write_span_row_data(
         &self,
         span: &Span,
         fields: &[FieldDef],
         metadata_fields: &MetadataFields,
-    ) -> Vec<u8> {
-        let mut buffer = Vec::with_capacity(fields.len() * 50);
-
+        buffer: &mut Vec<u8>,
+    ) {
         // Pre-calculate timestamp (use start time as primary timestamp for both fields)
         let formatted_timestamp = Self::format_timestamp(span.start_time_unix_nano);
 
         for field in fields {
             match field.name.as_ref() {
-                FIELD_ENV_NAME => BondWriter::write_string(&mut buffer, &metadata_fields.env_name),
-                FIELD_ENV_VER => BondWriter::write_string(&mut buffer, &metadata_fields.env_ver),
-                FIELD_TENANT => BondWriter::write_string(&mut buffer, &metadata_fields.tenant),
-                FIELD_ROLE => BondWriter::write_string(&mut buffer, &metadata_fields.role),
+                FIELD_ENV_NAME => BondWriter::write_string(buffer, &metadata_fields.env_name),
+                FIELD_ENV_VER => BondWriter::write_string(buffer, &metadata_fields.env_ver),
+                FIELD_TENANT => BondWriter::write_string(buffer, &metadata_fields.tenant),
+                FIELD_ROLE => BondWriter::write_string(buffer, &metadata_fields.role),
                 FIELD_ROLE_INSTANCE => {
-                    BondWriter::write_string(&mut buffer, &metadata_fields.role_instance)
+                    BondWriter::write_string(buffer, &metadata_fields.role_instance)
                 }
                 FIELD_TIMESTAMP | FIELD_ENV_TIME => {
-                    BondWriter::write_string(&mut buffer, &formatted_timestamp);
+                    BondWriter::write_string(buffer, &formatted_timestamp);
                 }
                 FIELD_KIND => {
-                    BondWriter::write_numeric(&mut buffer, span.kind);
+                    BondWriter::write_numeric(buffer, span.kind);
                 }
                 FIELD_START_TIME => {
-                    BondWriter::write_string(&mut buffer, &formatted_timestamp);
+                    BondWriter::write_string(buffer, &formatted_timestamp);
                 }
                 FIELD_SUCCESS => {
                     // Determine success based on status
@@ -631,67 +646,64 @@ impl OtlpEncoder {
                         }
                         None => true, // No status defaults to true
                     };
-                    BondWriter::write_bool(&mut buffer, success);
+                    BondWriter::write_bool(buffer, success);
                 }
                 FIELD_TRACE_ID => {
                     let hex_bytes = Self::encode_id_to_hex::<32>(&span.trace_id);
                     let hex_str = std::str::from_utf8(&hex_bytes)
                         .expect("hex encoding always produces valid UTF-8");
-                    BondWriter::write_string(&mut buffer, hex_str);
+                    BondWriter::write_string(buffer, hex_str);
                 }
                 FIELD_SPAN_ID => {
                     let hex_bytes = Self::encode_id_to_hex::<16>(&span.span_id);
                     let hex_str = std::str::from_utf8(&hex_bytes)
                         .expect("hex encoding always produces valid UTF-8");
-                    BondWriter::write_string(&mut buffer, hex_str);
+                    BondWriter::write_string(buffer, hex_str);
                 }
                 FIELD_TRACE_FLAGS => {
-                    BondWriter::write_numeric(&mut buffer, span.flags);
+                    BondWriter::write_numeric(buffer, span.flags);
                 }
                 FIELD_NAME => {
-                    BondWriter::write_string(&mut buffer, &span.name);
+                    BondWriter::write_string(buffer, &span.name);
                 }
                 FIELD_TRACE_STATE => {
-                    BondWriter::write_string(&mut buffer, &span.trace_state);
+                    BondWriter::write_string(buffer, &span.trace_state);
                 }
                 FIELD_PARENT_ID => {
                     let hex_bytes = Self::encode_id_to_hex::<16>(&span.parent_span_id);
                     let hex_str = std::str::from_utf8(&hex_bytes)
                         .expect("hex encoding always produces valid UTF-8");
-                    BondWriter::write_string(&mut buffer, hex_str);
+                    BondWriter::write_string(buffer, hex_str);
                 }
                 FIELD_LINKS => {
                     // Manual JSON building to avoid intermediate allocations
                     let links_json = Self::serialize_links(&span.links);
-                    BondWriter::write_string(&mut buffer, &links_json);
+                    BondWriter::write_string(buffer, &links_json);
                 }
                 FIELD_STATUS_MESSAGE => {
                     if let Some(status) = &span.status {
-                        BondWriter::write_string(&mut buffer, &status.message);
+                        BondWriter::write_string(buffer, &status.message);
                     }
                 }
                 _ => {
                     // Handle dynamic attributes
                     // TODO - optimize better - we could update determine_fields to also return a vec of bytes which has bond serialized attributes
                     if let Some(attr) = span.attributes.iter().find(|a| a.key == field.name) {
-                        self.write_attribute_value(&mut buffer, attr, field.type_id);
+                        self.write_attribute_value(buffer, attr, field.type_id);
                     }
                 }
             }
         }
-
-        buffer
     }
 
-    /// Write row data directly from LogRecord
+    /// Write row data directly from LogRecord, appending to the provided buffer.
     fn write_row_data(
         &self,
         log: &LogRecord,
         sorted_fields: &[FieldDef],
         metadata_fields: &MetadataFields,
-    ) -> Vec<u8> {
-        let mut buffer = Vec::with_capacity(sorted_fields.len() * 50); //TODO - estimate better
-
+        buffer: &mut Vec<u8>,
+    ) {
         // Pre-calculate timestamp to avoid duplicate computation for FIELD_TIMESTAMP and FIELD_ENV_TIME
         let formatted_timestamp = {
             let timestamp_nanos = if log.time_unix_nano != 0 {
@@ -704,45 +716,43 @@ impl OtlpEncoder {
 
         for field in sorted_fields {
             match field.name.as_ref() {
-                FIELD_ENV_NAME => BondWriter::write_string(&mut buffer, &metadata_fields.env_name),
-                FIELD_ENV_VER => BondWriter::write_string(&mut buffer, &metadata_fields.env_ver),
-                FIELD_TENANT => BondWriter::write_string(&mut buffer, &metadata_fields.tenant),
-                FIELD_ROLE => BondWriter::write_string(&mut buffer, &metadata_fields.role),
+                FIELD_ENV_NAME => BondWriter::write_string(buffer, &metadata_fields.env_name),
+                FIELD_ENV_VER => BondWriter::write_string(buffer, &metadata_fields.env_ver),
+                FIELD_TENANT => BondWriter::write_string(buffer, &metadata_fields.tenant),
+                FIELD_ROLE => BondWriter::write_string(buffer, &metadata_fields.role),
                 FIELD_ROLE_INSTANCE => {
-                    BondWriter::write_string(&mut buffer, &metadata_fields.role_instance)
+                    BondWriter::write_string(buffer, &metadata_fields.role_instance)
                 }
                 FIELD_TIMESTAMP | FIELD_ENV_TIME => {
-                    BondWriter::write_string(&mut buffer, &formatted_timestamp);
+                    BondWriter::write_string(buffer, &formatted_timestamp);
                 }
                 FIELD_TRACE_ID => {
                     let hex_bytes = Self::encode_id_to_hex::<32>(&log.trace_id);
                     let hex_str = std::str::from_utf8(&hex_bytes)
                         .expect("hex encoding always produces valid UTF-8");
-                    BondWriter::write_string(&mut buffer, hex_str);
+                    BondWriter::write_string(buffer, hex_str);
                 }
                 FIELD_SPAN_ID => {
                     let hex_bytes = Self::encode_id_to_hex::<16>(&log.span_id);
                     let hex_str = std::str::from_utf8(&hex_bytes)
                         .expect("hex encoding always produces valid UTF-8");
-                    BondWriter::write_string(&mut buffer, hex_str);
+                    BondWriter::write_string(buffer, hex_str);
                 }
                 FIELD_TRACE_FLAGS => {
-                    BondWriter::write_numeric(&mut buffer, log.flags);
+                    BondWriter::write_numeric(buffer, log.flags);
                 }
                 FIELD_NAME => {
-                    BondWriter::write_string(&mut buffer, &log.event_name);
+                    BondWriter::write_string(buffer, &log.event_name);
                 }
-                FIELD_SEVERITY_NUMBER => {
-                    BondWriter::write_numeric(&mut buffer, log.severity_number)
-                }
+                FIELD_SEVERITY_NUMBER => BondWriter::write_numeric(buffer, log.severity_number),
                 FIELD_SEVERITY_TEXT => {
-                    BondWriter::write_string(&mut buffer, &log.severity_text);
+                    BondWriter::write_string(buffer, &log.severity_text);
                 }
                 FIELD_BODY => {
                     // TODO - handle all types of body values - For now, we only handle string values
                     if let Some(body) = &log.body {
                         if let Some(Value::StringValue(s)) = &body.value {
-                            BondWriter::write_string(&mut buffer, s);
+                            BondWriter::write_string(buffer, s);
                         }
                     }
                 }
@@ -750,13 +760,11 @@ impl OtlpEncoder {
                     // Handle dynamic attributes
                     // TODO - optimize better - we could update determine_fields to also return a vec of bytes which has bond serialized attributes
                     if let Some(attr) = log.attributes.iter().find(|a| a.key == field.name) {
-                        self.write_attribute_value(&mut buffer, attr, field.type_id);
+                        self.write_attribute_value(buffer, attr, field.type_id);
                     }
                 }
             }
         }
-
-        buffer
     }
 
     fn encode_id_to_hex<const N: usize>(id: &[u8]) -> [u8; N] {
@@ -1455,5 +1463,41 @@ mod tests {
 
         assert_eq!(span_result.len(), 1);
         assert_eq!(span_result[0].row_count, 2);
+    }
+
+    #[test]
+    fn test_deterministic_encoding_across_calls() {
+        let encoder = OtlpEncoder::new();
+        let metadata = make_metadata("test");
+
+        let logs: Vec<LogRecord> = (0..5)
+            .map(|i| {
+                let mut log = LogRecord {
+                    observed_time_unix_nano: 1_700_000_000_000_000_000 + i,
+                    event_name: "test_event".to_string(),
+                    severity_number: 9,
+                    severity_text: "INFO".to_string(),
+                    ..Default::default()
+                };
+                log.attributes.push(KeyValue {
+                    key: "key".to_string(),
+                    value: Some(AnyValue {
+                        value: Some(Value::StringValue(format!("value_{i}"))),
+                    }),
+                });
+                log
+            })
+            .collect();
+
+        // Encode the same batch twice — output must be identical
+        let result1 = encoder.encode_log_batch(logs.iter(), &metadata).unwrap();
+        let result2 = encoder.encode_log_batch(logs.iter(), &metadata).unwrap();
+
+        assert_eq!(result1.len(), result2.len());
+        for (a, b) in result1.iter().zip(result2.iter()) {
+            assert_eq!(a.event_name, b.event_name);
+            assert_eq!(a.data, b.data);
+            assert_eq!(a.row_count, b.row_count);
+        }
     }
 }

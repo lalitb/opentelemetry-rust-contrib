@@ -25,11 +25,13 @@ mod tests {
             fields,
         };
 
+        let row_len = row_data.len();
         let event = CentralEventEntry {
             schema_id,
             level: 5,
             event_name: std::sync::Arc::new("basename".to_string()),
-            row: row_data,
+            row_offset: 0,
+            row_len,
         };
 
         let metadata =
@@ -41,6 +43,7 @@ mod tests {
             metadata: metadata.to_string(),
             schemas: vec![schema_entry],
             events: vec![event],
+            row_data,
         };
 
         blob.to_bytes()

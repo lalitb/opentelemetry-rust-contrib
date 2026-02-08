@@ -84,7 +84,9 @@ pub(crate) struct CentralEventEntry {
     pub schema_id: u64,
     pub level: u8,
     pub event_name: Arc<String>,
-    pub row: Vec<u8>,
+    /// Byte range into the parent `CentralBlob::row_data` buffer.
+    pub row_offset: usize,
+    pub row_len: usize,
 }
 
 const TERMINATOR: u64 = 0xdeadc0dedeadc0de;
@@ -133,6 +135,8 @@ pub(crate) struct CentralBlob {
     pub metadata: String, // UTF-8, will be stored as UTF-16LE
     pub schemas: Vec<CentralSchemaEntry>,
     pub events: Vec<CentralEventEntry>,
+    /// Contiguous buffer holding all row data. Events reference slices via (offset, len).
+    pub row_data: Vec<u8>,
 }
 
 impl CentralBlob {
@@ -176,9 +180,7 @@ impl CentralBlob {
         estimated_size += events_with_utf16
             .iter()
             .map(|(e, evname_utf16)| {
-                let row_len = {
-                    4 + &e.row.len() // SP header (4), row_bytes
-                };
+                let row_len = 4 + e.row_len; // SP header (4), row_bytes
                 2 + 8 + 1 + 2 + 4 + evname_utf16.len() + row_len + 8
             })
             .sum::<usize>();
@@ -214,11 +216,13 @@ impl CentralBlob {
             buf.extend_from_slice(&(evname_utf16.len() as u16).to_le_bytes()); // TODO - check for overflow
             buf.extend_from_slice(&evname_utf16);
 
-            let total_len = 4 + &event.row.len(); // SP header + data
+            let total_len = 4 + event.row_len; // SP header + data
 
             buf.extend_from_slice(&(total_len as u32).to_le_bytes()); // TODO - check for overflow
             buf.extend_from_slice(&[0x53, 0x50, 0x01, 0x00]); // Simple Protocol header
-            buf.extend_from_slice(&event.row);
+            buf.extend_from_slice(
+                &self.row_data[event.row_offset..event.row_offset + event.row_len],
+            );
 
             buf.extend_from_slice(&TERMINATOR.to_le_bytes());
         }
@@ -267,17 +271,18 @@ mod tests {
         };
 
         // Prepare a row
-        let mut row = Vec::new();
-        row.extend_from_slice(&42i32.to_le_bytes());
+        let mut row_data = Vec::new();
+        row_data.extend_from_slice(&42i32.to_le_bytes());
         let s = "hello";
-        row.extend_from_slice(&(s.len() as u32).to_le_bytes());
-        row.extend_from_slice(s.as_bytes());
+        row_data.extend_from_slice(&(s.len() as u32).to_le_bytes());
+        row_data.extend_from_slice(s.as_bytes());
 
         let event = CentralEventEntry {
             schema_id,
             level: 0, // e.g. ETW verbose
             event_name: Arc::new("eventname".to_string()),
-            row,
+            row_offset: 0,
+            row_len: row_data.len(),
         };
 
         // Metadata
@@ -291,6 +296,7 @@ mod tests {
             metadata: metadata.to_string(),
             schemas: vec![schema],
             events: vec![event],
+            row_data,
         };
 
         let payload = blob.to_bytes();
