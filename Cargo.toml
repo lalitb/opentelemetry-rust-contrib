@@ -50,3 +50,7 @@ tail_expr_drop_order = "allow"
 [workspace.lints.clippy]
 all = { level = "warn", priority = 1 }
 
+[patch.crates-io]
+# Carry the RUSTSEC-2026-0009 fix locally without raising the workspace MSRV to
+# the newer upstream `time` release line.
+time = { path = "third_party/time" }
