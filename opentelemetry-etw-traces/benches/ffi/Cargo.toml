@@ -1,0 +1,19 @@
+[package]
+name = "etw-ffi-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+opentelemetry = { version = "=0.33.1", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "=0.33.1", default-features = false, features = ["trace"] }
+opentelemetry-etw-traces = { path = "../.." }
+tracelogging_dynamic = "=1.2.4"
+
+[profile.release]
+debug = 1
