@@ -10,6 +10,8 @@ try {
     if (!$Smoke) {
         & (Join-Path $PSScriptRoot 'run.ps1') -Mode memory
         & (Join-Path $PSScriptRoot 'report.ps1')
+    } else {
+        & (Join-Path $PSScriptRoot 'report.ps1') -Smoke
     }
     'completed' | Set-Content (Join-Path $build 'controller-status.txt')
 } catch {

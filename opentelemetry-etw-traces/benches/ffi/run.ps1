@@ -53,12 +53,18 @@ foreach ($file in @('Cargo.lock','Cargo.toml','run.ps1')) {
 foreach ($file in @('compiler.txt','build-sources.csv','build-binaries.csv','revision.txt')) {
     Copy-Item (Join-Path $build $file) $root
 }
-$orders = @(
-    @('native','wrapper','cpp'), @('wrapper','cpp','native'),
-    @('cpp','native','wrapper'), @('cpp','wrapper','native'),
-    @('wrapper','native','cpp'), @('native','cpp','wrapper')
-)
-$passes = if ($Smoke -or $Mode -eq 'check') { 1 } elseif ($Mode -eq 'latency') { 6 } else { 3 }
+$allVariants = @('native','wrapper','cpp','rust-reuse','rust-static','cpp-reuse','cpp-static')
+# Rotations and reversals: every variant occupies each position twice.
+$orders = for ($offset = 0; $offset -lt $allVariants.Count; ++$offset) {
+    $order = @(for ($i = 0; $i -lt $allVariants.Count; ++$i) {
+        $allVariants[($i + $offset) % $allVariants.Count]
+    })
+    ,$order
+    $reverse = $order.Clone()
+    [array]::Reverse($reverse)
+    ,$reverse
+}
+$passes = if ($Smoke -or $Mode -eq 'check') { 1 } elseif ($Mode -eq 'latency') { $orders.Count } else { 3 }
 try {
     for ($pass = 0; $pass -lt $passes; ++$pass) {
         $workloads = if ($pass % 2) { @(3,0) } else { @(0,3) }

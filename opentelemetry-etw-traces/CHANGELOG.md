@@ -3,6 +3,9 @@
 ## vNext
 
 - Bump OpenTelemetry dependencies to 0.33.1.
+- Port the nested-layout exporter optimizations from [#875](https://github.com/open-telemetry/opentelemetry-rust-contrib/pull/875):
+  stack-backed timestamp/ID formatting, borrowed error descriptions, and reduced
+  attribute searches, preserving encoding, field order, and first-duplicate handling.
 
 ## v0.2.0
 

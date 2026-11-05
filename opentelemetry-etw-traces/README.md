@@ -75,6 +75,14 @@ Instructions using Powershell:
     - Double-click the `provider_name/Span` in the left-panel.
     - You should see the events in the right-panel.
 
+## Experimental C/C++ Span ABI benchmark
+
+The opt-in [C/C++ Span API and ETW benchmark](benches/ffi/README.md) compares
+native Rust, copying C ABI wrappers, and reusable handles with copying or
+explicitly process-lifetime static inputs. It preserves the Rust SDK -> ETW
+pipeline. This standalone experiment is **not a supported production FFI API**;
+see its C/C++ examples, lifetime contracts, and Windows validation commands.
+
 ## OpenTelemetry Overview
 
 OpenTelemetry is an Observability framework and toolkit designed to create and

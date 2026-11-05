@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(etw_ffi_benchmark LANGUAGES CXX)
+project(etw_ffi_benchmark LANGUAGES C CXX)
 
 if(NOT WIN32 OR NOT MSVC OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
   message(FATAL_ERROR "This benchmark requires Windows x64 and MSVC.")
@@ -38,6 +38,13 @@ add_custom_command(TARGET driver POST_BUILD
 
 add_executable(capture capture.cc)
 target_link_libraries(capture PRIVATE tdh)
+add_executable(c_contract c_contract.c)
+target_compile_features(c_contract PRIVATE c_std_11)
+target_compile_options(c_contract PRIVATE /O2 /W4 /WX)
+target_link_libraries(c_contract PRIVATE etw_ffi_bench)
+set_target_properties(c_contract PROPERTIES
+  MSVC_RUNTIME_LIBRARY MultiThreadedDLL
+  RUNTIME_OUTPUT_DIRECTORY "$<1:${CMAKE_CURRENT_BINARY_DIR}/bin>")
 foreach(target driver capture)
   target_compile_features(${target} PRIVATE cxx_std_17)
   target_compile_definitions(${target} PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
@@ -47,3 +54,7 @@ foreach(target driver capture)
     MSVC_RUNTIME_LIBRARY MultiThreadedDLL
     RUNTIME_OUTPUT_DIRECTORY "$<1:${CMAKE_CURRENT_BINARY_DIR}/bin>")
 endforeach()
+
+enable_testing()
+add_test(NAME c_contract COMMAND c_contract)
+add_test(NAME cpp_contract COMMAND driver contracts)

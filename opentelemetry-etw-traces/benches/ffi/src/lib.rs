@@ -1,33 +1,15 @@
-/*
-    Preliminary standalone results, 2026-11-03 (microseconds per complete span).
-    Exporter: 2a34861319802fc33865f1825385f698a50f3f17; rustc 1.99.0, MSVC /O2.
-    AMD EPYC 7763 VM: 8 guest-visible cores / 16 logical CPUs, 63.95 GiB RAM;
-    Windows 11 Enterprise x64 10.0.26300. Inventory captured before/after each run.
-    File-mode ETW, PID-filtered, perf clock, 64 KiB buffers (min 2048 / max 4096).
-    Affinity mask 1; six processes/case, seven batches of 10,000 spans/process,
-    1,000 warm-up spans/batch. Values are pooled medians of batch averages.
-
-    | Attributes | Native Rust | Rust via wrapper | C++ via DLL | C++ vs native |
-    |------------|-------------|------------------|-------------|---------------|
-    | 0          | 2.932       | 3.093            | 3.067       | +4.6%         |
-    | 3          | 3.200       | 3.621            | 3.641       | +13.8%        |
-
-    Native Rust enters the DLL once per batch; C++ makes three API calls/span.
-    Wrapper/C++ allocations: 8/13 versus native 6/7; all retain 512 bytes/thread.
-    2,790,036 latency/memory events decoded, zero capture loss.
-    C++ versus the same wrapper called from Rust: -0.84% / +0.56% pooled;
-    paired differences varied both ways. This is not an equivalence proof.
-    These measurements preceded repository packaging; see README.md for details.
-*/
-
 //! Experimental benchmark ABI. Non-null pointers must reference valid, correctly aligned
-//! caller-owned memory for the call. Span handles are thread-affine and consumed
-//! by end; providers must outlive their spans. No Rust allocations cross ownership.
+//! memory with no concurrent handle access. Handles are fixed to their creating thread.
+//! End spans in LIFO order; providers must outlive active spans and provider calls.
+//! The original API copies strings and consumes handles. Reusable handles have explicit
+//! destruction, and only `etw_span_begin_static` opts into process-lifetime string borrowing.
 
 use opentelemetry::trace::{SpanKind, Status, TraceContextExt, Tracer, TracerProvider};
 use opentelemetry::{Context, ContextGuard, KeyValue};
 use opentelemetry_etw_traces::Processor;
 use opentelemetry_sdk::trace::{Sampler, SdkTracer, SdkTracerProvider};
+use std::borrow::Cow;
+use std::cell::Cell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::pin::Pin;
 use std::ptr;
@@ -39,6 +21,13 @@ const NAME: &str = "BenchmarkOperation";
 const BAD_ARGUMENT: u32 = 1;
 const WRONG_THREAD: u32 = 2;
 const PANIC: u32 = 3;
+const INVALID_STATE: u32 = 4;
+const OUT_OF_ORDER: u32 = 5;
+
+thread_local! {
+    // Intrusive stack: stable Rust-owned handle addresses, not an allocated stack.
+    static CURRENT_HANDLE: Cell<*const SpanHandle> = const { Cell::new(ptr::null()) };
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -55,6 +44,8 @@ impl Text {
         }
     }
 
+    /// The caller must keep the referenced bytes readable and immutable for `'a`.
+    /// Null is permitted only for an empty string. UTF-8 validation does not allocate.
     unsafe fn read<'a>(self) -> Result<&'a str, u32> {
         if self.len > isize::MAX as usize || (self.len != 0 && self.data.is_null()) {
             return Err(BAD_ARGUMENT);
@@ -83,16 +74,71 @@ pub struct ProviderHandle {
     attributes: Vec<KeyValue>,
 }
 
-pub struct SpanHandle {
-    context: Context,
+struct Attachment {
     guard: Option<ContextGuard>,
-    owner: ThreadId,
+    previous: *const SpanHandle,
 }
 
-impl Drop for SpanHandle {
+impl Drop for Attachment {
     fn drop(&mut self) {
-        self.context.span().end();
         drop(self.guard.take());
+        CURRENT_HANDLE.with(|current| current.set(self.previous));
+    }
+}
+
+struct ActiveSpan {
+    context: Context,
+    _attachment: Attachment,
+}
+
+impl Drop for ActiveSpan {
+    fn drop(&mut self) {
+        // Attachment also unwinds on an exporter panic, restoring both stacks.
+        self.context.span().end();
+    }
+}
+
+pub struct SpanHandle {
+    owner: ThreadId,
+    reusable: bool,
+    active: Option<ActiveSpan>,
+}
+
+impl SpanHandle {
+    fn new(reusable: bool) -> Self {
+        Self {
+            owner: std::thread::current().id(),
+            reusable,
+            active: None,
+        }
+    }
+
+    fn begin(&mut self, provider: &ProviderHandle, name: Cow<'static, str>, attrs: Vec<KeyValue>) {
+        let mut builder = provider
+            .tracer
+            .span_builder(name)
+            .with_kind(SpanKind::Server);
+        // Move this one buffer into the SDK; do not collect or deep-clone it again.
+        builder.attributes = Some(attrs);
+        let span = builder.start(&provider.tracer);
+        let context = Context::current_with_span(span);
+        let guard = context.clone().attach();
+        let previous = CURRENT_HANDLE.with(|current| current.replace(self));
+        self.active = Some(ActiveSpan {
+            context,
+            _attachment: Attachment {
+                guard: Some(guard),
+                previous,
+            },
+        });
+    }
+
+    fn can_end(&self) -> Result<(), u32> {
+        self.active.as_ref().ok_or(INVALID_STATE)?;
+        if !CURRENT_HANDLE.with(|current| ptr::eq(current.get(), self)) {
+            return Err(OUT_OF_ORDER);
+        }
+        Ok(())
     }
 }
 
@@ -110,6 +156,60 @@ unsafe fn span_ref<'a>(span: *mut SpanHandle) -> Result<&'a SpanHandle, u32> {
         return Err(WRONG_THREAD);
     }
     Ok(span)
+}
+
+#[derive(Clone, Copy)]
+enum Strings {
+    Copy,
+    Static,
+}
+
+impl Strings {
+    /// All bytes must be valid for this call. For `Static`, they must additionally
+    /// remain immutable and valid until process exit, including module residency.
+    unsafe fn read(self, text: Text) -> Result<Cow<'static, str>, u32> {
+        match self {
+            Self::Copy => Ok(Cow::Owned(text.read()?.to_owned())),
+            // This is the only foreign-to-'static lifetime conversion. The explicit
+            // static entrypoint's caller guarantees the above lifetime, not the pointer
+            // value, descriptor lifetime, or successful UTF-8 validation.
+            Self::Static => Ok(Cow::Borrowed(text.read::<'static>()?)),
+        }
+    }
+}
+
+/// Descriptors need only live for this call. String lifetimes follow `strings`.
+unsafe fn inputs(
+    name: Text,
+    attributes: *const Attribute,
+    count: usize,
+    strings: Strings,
+) -> Result<(Cow<'static, str>, Vec<KeyValue>), u32> {
+    if count > isize::MAX as usize / std::mem::size_of::<Attribute>()
+        || (count != 0 && attributes.is_null())
+    {
+        return Err(BAD_ARGUMENT);
+    }
+    let name = strings.read(name)?;
+    let input = if count == 0 {
+        &[]
+    } else {
+        std::slice::from_raw_parts(attributes, count)
+    };
+    let mut owned = Vec::with_capacity(count);
+    for attribute in input {
+        let key = strings.read(attribute.key)?;
+        let value = match attribute.kind {
+            1 => KeyValue::new(key, strings.read(attribute.string_value)?),
+            2 => KeyValue::new(key, attribute.integer_value),
+            3 if matches!(attribute.integer_value, 0 | 1) => {
+                KeyValue::new(key, attribute.integer_value != 0)
+            }
+            _ => return Err(BAD_ARGUMENT),
+        };
+        owned.push(value);
+    }
+    Ok((name, owned))
 }
 
 #[no_mangle]
@@ -197,7 +297,8 @@ pub unsafe extern "C" fn etw_provider_guid(output: *mut u8) {
 #[inline(never)]
 /// # Safety
 /// Provider and input buffers must be valid for this call; output must be writable.
-/// A successful call owns copies of its inputs. End the handle on this same thread.
+/// The output slot must not own a live handle. A successful call owns copies of all
+/// strings/descriptors. End on this same thread, in LIFO order, using `etw_span_end`.
 pub unsafe extern "C" fn etw_span_begin(
     provider: *const ProviderHandle,
     name: Text,
@@ -209,45 +310,79 @@ pub unsafe extern "C" fn etw_span_begin(
         let output = output.as_mut().ok_or(BAD_ARGUMENT)?;
         *output = ptr::null_mut();
         let provider = provider.as_ref().ok_or(BAD_ARGUMENT)?;
-        let name = name.read()?.to_owned();
-        if count > isize::MAX as usize / std::mem::size_of::<Attribute>()
-            || (count != 0 && attributes.is_null())
-        {
-            return Err(BAD_ARGUMENT);
-        }
-        let input = if count == 0 {
-            &[]
-        } else {
-            std::slice::from_raw_parts(attributes, count)
-        };
-        let mut owned = Vec::with_capacity(count);
-        for attribute in input {
-            let key = attribute.key.read()?.to_owned();
-            let value = match attribute.kind {
-                1 => KeyValue::new(key, attribute.string_value.read()?.to_owned()),
-                2 => KeyValue::new(key, attribute.integer_value),
-                3 if matches!(attribute.integer_value, 0 | 1) => {
-                    KeyValue::new(key, attribute.integer_value != 0)
-                }
-                _ => return Err(BAD_ARGUMENT),
-            };
-            owned.push(value);
-        }
-        let span = provider
-            .tracer
-            .span_builder(name)
-            .with_kind(SpanKind::Server)
-            .with_attributes(owned)
-            .start(&provider.tracer);
-        let context = Context::current_with_span(span);
-        let guard = context.clone().attach();
-        *output = Box::into_raw(Box::new(SpanHandle {
-            context,
-            guard: Some(guard),
-            owner: std::thread::current().id(),
-        }));
+        let (name, owned) = inputs(name, attributes, count, Strings::Copy)?;
+        let mut handle = Box::new(SpanHandle::new(false));
+        handle.begin(provider, name, owned);
+        *output = Box::into_raw(handle);
         Ok(())
     })
+}
+
+#[no_mangle]
+/// # Safety
+/// `output` must be a writable slot not owning a live handle. Destroy this handle
+/// with `etw_span_handle_destroy` on this thread, while inactive. Storage is Rust-owned.
+pub unsafe extern "C" fn etw_span_handle_create(output: *mut *mut SpanHandle) -> u32 {
+    boundary(|| {
+        let output = output.as_mut().ok_or(BAD_ARGUMENT)?;
+        *output = ptr::null_mut();
+        *output = Box::into_raw(Box::new(SpanHandle::new(true)));
+        Ok(())
+    })
+}
+
+/// Pointers and lifetimes must satisfy the selected public begin entrypoint.
+unsafe fn begin_reuse(
+    provider: *const ProviderHandle,
+    name: Text,
+    attributes: *const Attribute,
+    count: usize,
+    span: *mut SpanHandle,
+    strings: Strings,
+) -> Result<(), u32> {
+    let handle = span_ref(span)?;
+    if !handle.reusable || handle.active.is_some() {
+        return Err(INVALID_STATE);
+    }
+    let provider = provider.as_ref().ok_or(BAD_ARGUMENT)?;
+    let (name, owned) = inputs(name, attributes, count, strings)?;
+    // No mutable access until the owner-thread and lifecycle checks have passed.
+    (*span).begin(provider, name, owned);
+    Ok(())
+}
+
+#[no_mangle]
+#[inline(never)]
+/// # Safety
+/// `span` must be a live reusable handle with no concurrent use. Provider and inputs
+/// must be valid during this call; the provider must outlive the active span.
+/// All strings are copied. Descriptors and bytes may be overwritten/freed on return.
+pub unsafe extern "C" fn etw_span_begin_reuse(
+    provider: *const ProviderHandle,
+    name: Text,
+    attributes: *const Attribute,
+    count: usize,
+    span: *mut SpanHandle,
+) -> u32 {
+    boundary(|| begin_reuse(provider, name, attributes, count, span, Strings::Copy))
+}
+
+#[no_mangle]
+#[inline(never)]
+/// # Safety
+/// As for `etw_span_begin_reuse`, EXCEPT all name/key/string-value bytes must remain
+/// immutable and valid until process exit, even after end/destroy/provider shutdown.
+/// Keep their containing modules loaded. Only the descriptor array is call-scoped.
+/// This explicit promise permits `Strings::read` to produce `&'static str`; checking
+/// UTF-8 cannot verify that promise. Never use temporary or unloadable-module strings.
+pub unsafe extern "C" fn etw_span_begin_static(
+    provider: *const ProviderHandle,
+    name: Text,
+    attributes: *const Attribute,
+    count: usize,
+    span: *mut SpanHandle,
+) -> u32 {
+    boundary(|| begin_reuse(provider, name, attributes, count, span, Strings::Static))
 }
 
 #[no_mangle]
@@ -257,13 +392,14 @@ pub unsafe extern "C" fn etw_span_begin(
 pub unsafe extern "C" fn etw_span_status(span: *mut SpanHandle, status: u32) -> u32 {
     boundary(|| {
         let span = span_ref(span)?;
+        let active = span.active.as_ref().ok_or(INVALID_STATE)?;
         let status = match status {
             0 => Status::Unset,
             1 => Status::Ok,
             2 => Status::error(""),
             _ => return Err(BAD_ARGUMENT),
         };
-        span.context.span().set_status(status);
+        active.context.span().set_status(status);
         Ok(())
     })
 }
@@ -276,7 +412,47 @@ pub unsafe extern "C" fn etw_span_status(span: *mut SpanHandle, status: u32) -> 
 pub unsafe extern "C" fn etw_span_end(span: *mut *mut SpanHandle) -> u32 {
     boundary(|| {
         let slot = span.as_mut().ok_or(BAD_ARGUMENT)?;
-        span_ref(*slot)?;
+        let handle = span_ref(*slot)?;
+        if handle.reusable {
+            return Err(INVALID_STATE);
+        }
+        handle.can_end()?;
+        drop(Box::from_raw(std::mem::replace(slot, ptr::null_mut())));
+        Ok(())
+    })
+}
+
+#[no_mangle]
+#[inline(never)]
+/// # Safety
+/// `span` must be a live reusable handle with no concurrent use. End on its owner
+/// thread in LIFO order, without interfering with the attached context.
+/// This resets but never frees storage. Even on a caught export panic it is inactive;
+/// export may be incomplete. Exporter I/O failures are not conveyed by the SDK's end.
+pub unsafe extern "C" fn etw_span_end_reuse(span: *mut SpanHandle) -> u32 {
+    boundary(|| {
+        let handle = span_ref(span)?;
+        if !handle.reusable {
+            return Err(INVALID_STATE);
+        }
+        handle.can_end()?;
+        drop((*span).active.take());
+        Ok(())
+    })
+}
+
+#[no_mangle]
+/// # Safety
+/// `span` must be a writable slot holding a live reusable handle, with no concurrent
+/// use. Only its owner thread may destroy it, and only while inactive. Active destroy
+/// is rejected without ending the span. Success frees in Rust and nulls the slot.
+pub unsafe extern "C" fn etw_span_handle_destroy(span: *mut *mut SpanHandle) -> u32 {
+    boundary(|| {
+        let slot = span.as_mut().ok_or(BAD_ARGUMENT)?;
+        let handle = span_ref(*slot)?;
+        if !handle.reusable || handle.active.is_some() {
+            return Err(INVALID_STATE);
+        }
         drop(Box::from_raw(std::mem::replace(slot, ptr::null_mut())));
         Ok(())
     })
@@ -313,26 +489,7 @@ pub unsafe extern "C" fn etw_rust_batch(
                 native_emit(provider);
             }
         } else {
-            let attributes = [
-                Attribute {
-                    key: Text::borrowed("string_key"),
-                    kind: 1,
-                    string_value: Text::borrowed("benchmark-value"),
-                    integer_value: 0,
-                },
-                Attribute {
-                    key: Text::borrowed("integer_key"),
-                    kind: 2,
-                    string_value: Text::borrowed(""),
-                    integer_value: 42,
-                },
-                Attribute {
-                    key: Text::borrowed("bool_key"),
-                    kind: 3,
-                    string_value: Text::borrowed(""),
-                    integer_value: 1,
-                },
-            ];
+            let attributes = benchmark_attributes();
             for _ in 0..iterations {
                 let mut span = ptr::null_mut();
                 let code = etw_span_begin(
@@ -354,6 +511,69 @@ pub unsafe extern "C" fn etw_rust_batch(
         }
         Ok(())
     })
+}
+
+#[no_mangle]
+/// # Safety
+/// Provider and reusable handle must be live, on the owner thread, without concurrent
+/// use. The caller creates/destroys the handle outside timing. All borrowed strings
+/// below are Rust literals in this DLL, which must remain loaded until process exit.
+pub unsafe extern "C" fn etw_rust_batch_reuse(
+    provider: *const ProviderHandle,
+    span: *mut SpanHandle,
+    static_inputs: u32,
+    iterations: usize,
+) -> u32 {
+    boundary(|| {
+        let provider = provider.as_ref().ok_or(BAD_ARGUMENT)?;
+        let begin = match static_inputs {
+            0 => etw_span_begin_reuse,
+            1 => etw_span_begin_static,
+            _ => return Err(BAD_ARGUMENT),
+        };
+        let attributes = benchmark_attributes();
+        for _ in 0..iterations {
+            let code = begin(
+                provider,
+                Text::borrowed(NAME),
+                attributes.as_ptr(),
+                provider.attributes.len(),
+                span,
+            );
+            if code != 0 {
+                return Err(code);
+            }
+            let status = etw_span_status(span, 1);
+            let end = etw_span_end_reuse(span);
+            if status != 0 || end != 0 {
+                return Err(if status != 0 { status } else { end });
+            }
+        }
+        Ok(())
+    })
+}
+
+fn benchmark_attributes() -> [Attribute; 3] {
+    [
+        Attribute {
+            key: Text::borrowed("string_key"),
+            kind: 1,
+            string_value: Text::borrowed("benchmark-value"),
+            integer_value: 0,
+        },
+        Attribute {
+            key: Text::borrowed("integer_key"),
+            kind: 2,
+            string_value: Text::borrowed(""),
+            integer_value: 42,
+        },
+        Attribute {
+            key: Text::borrowed("bool_key"),
+            kind: 3,
+            string_value: Text::borrowed(""),
+            integer_value: 1,
+        },
+    ]
 }
 
 #[no_mangle]
@@ -391,3 +611,6 @@ pub extern "C" fn etw_allocator_self_test() {
         dealloc(c, c_layout);
     }
 }
+
+#[cfg(test)]
+mod tests;

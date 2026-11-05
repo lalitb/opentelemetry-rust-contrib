@@ -254,6 +254,18 @@ mod integration_tests {
         }
     }
 
+    fn wait_for_provider(provider_name: &str) -> std::pin::Pin<Box<tld::Provider>> {
+        let probe = Box::pin(tld::Provider::new(provider_name, &tld::Provider::options()));
+        // SAFETY: the probe remains pinned until drop unregisters the callback.
+        assert_eq!(unsafe { probe.as_ref().register() }, 0);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !probe.enabled(tld::Level::Verbose, 1) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(probe.enabled(tld::Level::Verbose, 1));
+        probe
+    }
+
     // -----------------------------------------------------------------------
     // Integration tests — require admin privileges to start an ETW session.
     //
@@ -291,7 +303,7 @@ mod integration_tests {
             .with_span_processor(processor)
             .build();
 
-        std::thread::sleep(Duration::from_millis(100));
+        let _probe = wait_for_provider(provider_name);
 
         let tracer = tracer_provider.tracer("test");
         tracer.in_span("my-span", |cx| {
@@ -350,5 +362,97 @@ mod integration_tests {
 
         trace.stop().unwrap();
         let _ = tracer_provider.shutdown();
+    }
+
+    #[ignore = "Requires admin privileges to start ETW trace session"]
+    #[test]
+    fn integration_test_optimized_encoding() {
+        use opentelemetry::trace::{
+            Span, SpanContext, SpanId, Status, TraceFlags, TraceId, TraceState,
+        };
+        use std::borrow::Cow;
+
+        let provider_name = "OTelETWTracesIntTest_Optimized";
+        let (trace, rx) = start_etw_trace(provider_name);
+        let tracer_provider = SdkTracerProvider::builder()
+            .with_resource(Resource::builder_empty().build())
+            .with_span_processor(crate::Processor::builder(provider_name).build().unwrap())
+            .build();
+        let _probe = wait_for_provider(provider_name);
+        let tracer = tracer_provider.tracer("encoding-test");
+        let parent = opentelemetry::Context::new().with_remote_span_context(SpanContext::new(
+            TraceId::from_bytes([0xab; 16]),
+            SpanId::from_bytes([0x0a; 8]),
+            TraceFlags::SAMPLED,
+            true,
+            TraceState::default(),
+        ));
+
+        // Alternate payload sizes to exercise reset of the exporter's reused buffer.
+        for count in [6, 0, 3] {
+            for description in ["failure \u{2603}", ""] {
+                for description in [
+                    Cow::Borrowed(description),
+                    Cow::Owned(description.to_string()),
+                ] {
+                    let mut attributes: Vec<_> = (0..count)
+                        .map(|i| KeyValue::new(format!("key{i}"), format!("value{i}")))
+                        .collect();
+                    attributes.extend([
+                        KeyValue::new("http.request.method", "GET"),
+                        KeyValue::new("db.system.name", "postgresql"),
+                        KeyValue::new("http.request.method", "POST"),
+                    ]);
+                    let mut span = tracer
+                        .span_builder("optimized-span")
+                        .with_start_time(std::time::UNIX_EPOCH + Duration::new(10, 123_456_000))
+                        .with_attributes(attributes)
+                        .start_with_context(&tracer, &parent);
+                    let span_id = span.span_context().span_id();
+                    span.set_status(Status::Error {
+                        description: description.clone(),
+                    });
+                    span.end_with_timestamp(std::time::UNIX_EPOCH + Duration::new(20, 987_654_300));
+                    let event = recv_event(&rx, "Span");
+                    assert_eq!(event.keyword, 1);
+                    assert_eq!(event.get_u16("__csver__"), Some(1024));
+                    assert_eq!(event.get_str("PartB.name"), Some("optimized-span"));
+                    assert_eq!(
+                        event.get_str("PartA.time"),
+                        Some("1970-01-01T00:00:20.987654300Z")
+                    );
+                    assert_eq!(
+                        event.get_str("PartB.startTime"),
+                        Some("1970-01-01T00:00:10.123456Z")
+                    );
+                    assert_eq!(
+                        event.get_str("PartA.ext_dt.traceId"),
+                        Some("abababababababababababababababab")
+                    );
+                    assert_eq!(
+                        event.get_str("PartA.ext_dt.spanId"),
+                        Some(span_id.to_string().as_str())
+                    );
+                    assert_eq!(event.get_str("PartB.parentId"), Some("0a0a0a0a0a0a0a0a"));
+                    assert_eq!(event.get_str("PartB.httpMethod"), Some("GET"));
+                    assert_eq!(event.get_str("PartB.dbSystem"), Some("postgresql"));
+                    assert!(!event.has("PartC.http.request.method"));
+                    assert_eq!(event.get_bool("PartB.success"), Some(false));
+                    assert_eq!(
+                        event.get_str("PartB.statusMessage"),
+                        (!description.is_empty()).then_some(description.as_ref())
+                    );
+                    for i in 0..6 {
+                        let value = format!("value{i}");
+                        assert_eq!(
+                            event.get_str(&format!("PartC.key{i}")),
+                            (i < count).then_some(value.as_str())
+                        );
+                    }
+                }
+            }
+        }
+        trace.stop().unwrap();
+        tracer_provider.shutdown().unwrap();
     }
 }
