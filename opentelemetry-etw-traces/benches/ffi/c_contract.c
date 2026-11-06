@@ -24,6 +24,14 @@ int main(void)
     CHECK(etw_span_begin_static(provider, static_name, NULL, 0, span));
     CHECK(etw_span_status(span, 1));
     CHECK(etw_span_end_reuse(span));
+    {
+      char borrowed_name[] = "BenchmarkOperation";
+      EtwText borrowed_text = {borrowed_name, sizeof(borrowed_name) - 1};
+      CHECK(etw_span_begin_borrowed(provider, borrowed_text, NULL, 0, span));
+      CHECK(etw_span_status(span, 1));
+      CHECK(etw_span_end_reuse(span));
+      memset(borrowed_name, 'X', sizeof(borrowed_name) - 1);
+    }
   }
   CHECK(etw_span_handle_destroy(&span));
   if (span != NULL) return __LINE__;

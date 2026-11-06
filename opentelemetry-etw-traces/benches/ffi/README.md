@@ -17,6 +17,7 @@ are 1 (string), 2 (int64), and 3 (boolean, represented by 0 or 1).
 | `etw_span_begin` / `etw_span_end` | Existing API: begin copies inputs and allocates an active handle; end ends/exports, restores context, frees in Rust, and nulls the slot. |
 | `etw_span_handle_create` | Allocates inactive, reusable opaque storage once, on its owner thread. |
 | `etw_span_begin_reuse` | Initializes inactive storage, copying all strings. Caller buffers may be overwritten or freed after return. |
+| `etw_span_begin_borrowed` | Initializes inactive storage without copying string bytes. Keep them alive and unchanged until synchronous end returns. |
 | `etw_span_begin_static` | Initializes inactive storage with explicitly borrowed process-lifetime strings; see the stronger contract below. |
 | `etw_span_status` | Works on either kind of active handle: 0 = Unset, 1 = Ok, 2 = Error. |
 | `etw_span_end_reuse` | Ends through the SDK and ETW processor, restores the previous context, and resets to inactive without freeing storage. |
@@ -46,9 +47,41 @@ delivery was guaranteed. Null/UTF-8/lifecycle checks cannot make arbitrary,
 dangling, misaligned, or concurrently accessed foreign pointers safe. C/C++
 must never `free` or `delete` Rust handles.
 
+### Borrowing local strings until synchronous end returns
+
+Use `etw_span_begin_borrowed` with ordinary local `std::string` or `char[]`
+inputs. **All span-name, attribute-key, and string-value bytes must remain alive
+and unchanged from begin through the return of `etw_span_end_reuse`.** Do not
+modify, move, destroy, or reallocate their storage while the span is active.
+String literals and local strings can be mixed under this same contract.
+
+End synchronously exports and resets the handle. After it returns `ETW_OK`, or
+`ETW_PANIC` following export cleanup, the bytes may be changed or freed immediately;
+the inactive handle can still be reused. A rejected end, such as wrong-thread or
+out-of-order end, leaves the span active and **does not release the borrow**.
+A failed begin retains no new input bytes; if the handle was already active,
+the original span's input lifetime obligation remains.
+
+Only string bytes are borrowed. The attribute descriptor array need only live
+during begin, and numeric values are copied. The FFI validates UTF-8 without
+copying its contents, then moves its attribute vector directly into the SDK.
+
+This relies on the fixed provider created by `etw_provider_create`: the existing
+Rust SDK 0.33.1 uses `AlwaysOn`, and the existing contrib ETW `Processor` exports
+synchronously without retaining span data. The SDK removes the span's data on
+end; the processor serializes it into the ETW event buffer and drops it before
+returning. The wrapper resets the active span and restores context before end
+returns. No changes to the SDK, ETW processor, or exporter APIs are required.
+
+Internally the SDK's string types require `&'static str`, so the FFI erases the
+shorter foreign lifetime in `Strings::read`. Its safety depends on that fixed,
+non-retaining pipeline and cleanup on both success and unwinding. This is not a
+contract for arbitrary SDK samplers/processors that cache or queue spans. Changes
+to the provider or pinned SDK need to recheck the no-retention invariant.
+
 ### Explicit static-string contract
 
-Only `etw_span_begin_static` permits borrowing. **Every span-name, attribute-key,
+`etw_span_begin_static` retains its original, stronger contract. **Every span-name, attribute-key,
 and string-value byte must remain immutable and valid until process exit**,
 including after end, handle destruction, and provider shutdown. Keep containing
 modules loaded for that entire lifetime. An ordinary temporary `std::string`,
@@ -58,10 +91,9 @@ meet the promise.
 
 The **attribute descriptor array needs to live only during begin** and may be
 overwritten/released immediately afterward. Integer/boolean values are copied.
-The opt-in conversion in `Strings::read` documents why the foreign bytes may be
-treated as `&'static str`. UTF-8 validation uses `str::from_utf8`, without allocating;
-it cannot establish lifetime. Static lifetime is never inferred from a pointer,
-nor silently applied to either copying API.
+The opt-in conversions in `Strings::read` document both borrowing contracts.
+UTF-8 validation uses `str::from_utf8`, without allocating; it cannot establish
+lifetime. Neither copying API silently borrows strings.
 
 ### C: reusable storage with temporary inputs
 
@@ -100,6 +132,46 @@ void example(void)
 For the original API, omit handle creation/destruction and call
 `etw_span_begin(..., &span)` / `etw_span_end(&span)` each cycle. Its dynamic-input
 ownership guarantee is unchanged.
+
+### C++: reusable storage borrowing local std::string inputs
+
+The provider must remain alive for this function. This example aborts on errors
+for brevity. String construction is application work; passing `data()`/`size()`
+and calling the borrowed FFI do not copy the string contents.
+
+```cpp
+#include "ffi.h"
+#include <cstdlib>
+#include <string>
+
+static EtwText text(const std::string &value) { return {value.data(), value.size()}; }
+static void check(uint32_t code) { if (code != ETW_OK) std::abort(); }
+
+void example(EtwProvider *provider)
+{
+    EtwSpan *span = nullptr;
+    check(etw_span_handle_create(&span));
+    for (unsigned i = 0; i < 100; ++i) {
+        std::string name = "operation-" + std::to_string(i);
+        std::string key = "request.path";
+        std::string value = "/items/" + std::to_string(i);
+        {
+            const EtwAttribute attributes[] = {
+                {text(key), 1, text(value), 0},
+            };
+            check(etw_span_begin_borrowed(provider, text(name), attributes, 1, span));
+        } // Descriptors may disappear; name/key/value must remain unchanged.
+        const auto status = etw_span_status(span, 1);
+        const auto end = etw_span_end_reuse(span); // synchronous export + cleanup
+        check(end);
+        check(status);
+        name.clear();  // Safe now: no input string references remain in Rust.
+        key.clear();
+        value.clear();
+    } // Local strings may be destroyed before the reusable handle.
+    check(etw_span_handle_destroy(&span));
+}
+```
 
 ### C++: reusable storage with immutable process-lifetime strings
 
@@ -142,8 +214,8 @@ void example(EtwProvider *provider) // caller keeps provider alive
 
 Reusable storage removes the per-span wrapper `Box` allocation; there is still
 one allocation when creating each handle. Copying begins still allocate/copy
-the nonempty span name, every key, and every string value. The static begin
-borrows those bytes instead. It does not retain the descriptor array.
+the nonempty span name, every key, and every string value. The borrowed and static
+begins reference those bytes instead. Neither retains the descriptor array.
 
 All paths still run the native Rust SDK. With attributes, the FFI builds **one
 `Vec<KeyValue>` and moves its buffer directly into `SpanBuilder.attributes`**.
@@ -188,6 +260,10 @@ The Rust loops enter the DLL once per batch; C++ makes three DLL calls/span.
 No synthetic application work is added. Reusable handles are created on the
 measuring thread before warm-up/timing and destroyed after measurement.
 They are reused across batches, not recreated inside `etw_rust_batch_reuse`.
+
+The seven timed variants and recorded results below predate the borrowed-until-end
+entrypoint. The C/C++ contract checks now also cover temporary strings with
+`etw_span_begin_borrowed`; no new latency/allocation measurements are claimed for it.
 
 Handle creation/destruction have separate `handle_create_ns`/`handle_destroy_ns`
 latency observations (one each per process, including timer noise; non-reusable
@@ -243,10 +319,13 @@ cargo test -p opentelemetry-etw-traces --all-features -- --ignored --test-thread
 ```
 
 The tests cover handle reuse, invalid lifecycles, dynamic buffers overwritten
-and freed before end, static byte borrowing with temporary descriptors, nested
+and freed before end, static byte borrowing with temporary descriptors, borrowed
+temporary strings released after end (including export panic), nested
 parent/context restoration, provider changes while inactive, wrong-thread
 rejection, export-panic cleanup, and equivalent SDK-exported content for the
-four Rust variants. No test intentionally supplies dangling static input.
+four Rust variants. Borrowing tests compare original input addresses with the
+addresses observed during synchronous export. Their observer retains only owned
+snapshots, never the borrowed `SpanData`. No test intentionally supplies dangling input.
 C/C++ contracts exercise the real DLL; ETL validation below checks exported
 content for **all seven variants**, including both C++ reusable paths.
 
@@ -276,9 +355,13 @@ source changes because run scripts reject stale manifests. Allow several GB
 for a full fourteen-pass capture. These results are not a comparison to a C++
 exporter, Linux user-events, or asynchronous/many-thread application workloads.
 
-### Validation of this implementation
+### Recorded validation before the borrowed-until-end addition
 
-On this Windows checkout, Rust 1.99.0 formatting/Clippy, nine Rust ABI contracts,
+The following Windows results were recorded before `etw_span_begin_borrowed` was
+added. New contract checks require a fresh build/run; the current C++ capture
+expects 18 contract events across the zero/three-attribute cases (previously 14).
+
+On the original Windows checkout, Rust 1.99.0 formatting/Clippy, nine Rust ABI contracts,
 the optimized exporter's 24 unit tests and two doc tests, the release DLL,
 MSVC 19.51.36260 C/C++ builds, and both CTest contracts passed. Both live ETW
 exporter integration tests also passed, including SDK-driven checks of timestamps,

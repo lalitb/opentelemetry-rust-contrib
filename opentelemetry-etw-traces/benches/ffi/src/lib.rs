@@ -2,7 +2,8 @@
 //! memory with no concurrent handle access. Handles are fixed to their creating thread.
 //! End spans in LIFO order; providers must outlive active spans and provider calls.
 //! The original API copies strings and consumes handles. Reusable handles have explicit
-//! destruction, and only `etw_span_begin_static` opts into process-lifetime string borrowing.
+//! destruction. `etw_span_begin_borrowed` borrows strings until synchronous end returns;
+//! `etw_span_begin_static` retains its stronger process-lifetime contract.
 
 use opentelemetry::trace::{SpanKind, Status, TraceContextExt, Tracer, TracerProvider};
 use opentelemetry::{Context, ContextGuard, KeyValue};
@@ -68,6 +69,11 @@ pub struct Attribute {
 }
 
 pub struct ProviderHandle {
+    // Borrowed-until-end safety invariant: the sampler and processors must never
+    // retain input strings past end. The only production constructor below uses
+    // AlwaysOn and the synchronous ETW Processor (whose on_start is a no-op).
+    // Do not add configurable/retaining processors or samplers without revisiting
+    // Strings::BorrowedUntilEnd. Test processors for this mode must obey this too.
     provider: SdkTracerProvider,
     tracer: SdkTracer,
     probe: Pin<Box<Provider>>,
@@ -162,18 +168,28 @@ unsafe fn span_ref<'a>(span: *mut SpanHandle) -> Result<&'a SpanHandle, u32> {
 enum Strings {
     Copy,
     Static,
+    BorrowedUntilEnd,
 }
 
 impl Strings {
     /// All bytes must be valid for this call. For `Static`, they must additionally
     /// remain immutable and valid until process exit, including module residency.
+    /// For `BorrowedUntilEnd`, they must remain immutable and valid until end has
+    /// reset the handle; the provider must satisfy ProviderHandle's invariant.
     unsafe fn read(self, text: Text) -> Result<Cow<'static, str>, u32> {
         match self {
             Self::Copy => Ok(Cow::Owned(text.read()?.to_owned())),
-            // This is the only foreign-to-'static lifetime conversion. The explicit
-            // static entrypoint's caller guarantees the above lifetime, not the pointer
-            // value, descriptor lifetime, or successful UTF-8 validation.
+            // This conversion relies on the static entrypoint's caller promise,
+            // not the pointer value, descriptor lifetime, or UTF-8 validation.
             Self::Static => Ok(Cow::Borrowed(text.read::<'static>()?)),
+            // SAFETY: the SDK's string types require 'static, so this erases the
+            // foreign borrow's shorter lifetime. This is confined to the fixed
+            // synchronous provider: AlwaysOn retains nothing, on_start is a no-op,
+            // and ETW serializes into its own buffer during on_end. SDK 0.33.1
+            // takes the span data on end and drops it before returning. End then
+            // drops ActiveSpan and its attachment. No borrowed strings may escape
+            // this path, including on failed begin or unwinding during export.
+            Self::BorrowedUntilEnd => Ok(Cow::Borrowed(text.read::<'static>()?)),
         }
     }
 }
@@ -365,6 +381,38 @@ pub unsafe extern "C" fn etw_span_begin_reuse(
     span: *mut SpanHandle,
 ) -> u32 {
     boundary(|| begin_reuse(provider, name, attributes, count, span, Strings::Copy))
+}
+
+#[no_mangle]
+#[inline(never)]
+/// # Safety
+/// As for `etw_span_begin_reuse`, EXCEPT all name/key/string-value bytes must remain
+/// readable and immutable from begin until `etw_span_end_reuse` resets the span and
+/// returns (ETW_OK or a caught export panic). Keep their owners and containing
+/// modules alive; do not modify or reallocate the bytes while the span is active.
+/// Rejected end calls, including wrong-thread/out-of-order end, leave the borrow
+/// active. A failed begin retains no new input bytes. Descriptors are call-scoped.
+///
+/// Only use the fixed provider created by `etw_provider_create`: its sampler and
+/// synchronous ETW processor retain no input strings past end. This lifetime
+/// erasure is not valid for arbitrary SDK processors that queue or retain spans.
+pub unsafe extern "C" fn etw_span_begin_borrowed(
+    provider: *const ProviderHandle,
+    name: Text,
+    attributes: *const Attribute,
+    count: usize,
+    span: *mut SpanHandle,
+) -> u32 {
+    boundary(|| {
+        begin_reuse(
+            provider,
+            name,
+            attributes,
+            count,
+            span,
+            Strings::BorrowedUntilEnd,
+        )
+    })
 }
 
 #[no_mangle]

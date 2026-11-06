@@ -72,10 +72,26 @@ __declspec(dllimport) uint32_t etw_span_end(EtwSpan **);
  *   etw_span_status(span, 1);
  *   etw_span_end_reuse(span);  // repeat begin/end, using the same storage
  *   etw_span_handle_destroy(&span);
- * Use begin_static instead only when ALL referenced bytes satisfy the promise below.
+ * Use begin_borrowed or begin_static to avoid string copies, with the lifetimes below.
  */
 __declspec(dllimport) uint32_t etw_span_handle_create(EtwSpan **);
 __declspec(dllimport) uint32_t etw_span_begin_reuse(
+    const EtwProvider *, EtwText, const EtwAttribute *, size_t, EtwSpan *);
+/* BORROW UNTIL SYNCHRONOUS END RETURNS:
+ * ALL span-name, key and string-value bytes must remain readable and immutable
+ * from begin until etw_span_end_reuse returns ETW_OK or ETW_PANIC after resetting
+ * the span. Local std::string/char[] inputs are allowed: keep their owners alive
+ * and do not modify, move, or reallocate their storage while the span is active.
+ * The descriptor array is needed only during begin. A failed begin retains no
+ * NEW input bytes. Rejected end calls (e.g. wrong thread/order) leave the span
+ * active, so its bytes must still remain valid. Check the end result before reuse.
+ *
+ * This contract relies on the fixed synchronous, non-retaining ETW pipeline
+ * created by etw_provider_create. No borrowed string survives completed end;
+ * strings may then be changed/freed while the inactive handle remains reusable.
+ * UTF-8 checks do not verify lifetime. No string contents are copied by the FFI.
+ */
+__declspec(dllimport) uint32_t etw_span_begin_borrowed(
     const EtwProvider *, EtwText, const EtwAttribute *, size_t, EtwSpan *);
 /* EXPLICIT STATIC-LIFETIME OPT-IN:
  * ALL span-name, key and string-value bytes must remain immutable and valid until

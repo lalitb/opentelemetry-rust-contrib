@@ -31,10 +31,17 @@ impl SpanProcessor for Capture {
 
 fn provider(count: usize) -> (ProviderHandle, Capture) {
     let capture = Capture::default();
+    (provider_with_processor(count, capture.clone()), capture)
+}
+
+fn provider_with_processor(
+    count: usize,
+    processor: impl SpanProcessor + 'static,
+) -> ProviderHandle {
     let provider = SdkTracerProvider::builder()
         .with_sampler(Sampler::AlwaysOn)
         .with_resource(opentelemetry_sdk::Resource::builder_empty().build())
-        .with_span_processor(capture.clone())
+        .with_span_processor(processor)
         .build();
     let tracer = provider.tracer("ffi-benchmark");
     let attributes = if count == 0 {
@@ -46,21 +53,213 @@ fn provider(count: usize) -> (ProviderHandle, Capture) {
             KeyValue::new("bool_key", true),
         ]
     };
-    (
-        ProviderHandle {
-            provider,
-            tracer,
-            probe: Box::pin(Provider::new(PROVIDER, &Provider::options())),
+    ProviderHandle {
+        provider,
+        tracer,
+        probe: Box::pin(Provider::new(PROVIDER, &Provider::options())),
+        attributes,
+    }
+}
+
+#[derive(Debug)]
+struct BorrowObservation {
+    // Owned snapshots for assertions after foreign buffers are freed. These
+    // test-only copies are made by the observer, never by the FFI under test.
+    name: String,
+    attributes: Vec<KeyValue>,
+    addresses: Vec<usize>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SynchronousCapture {
+    observations: Arc<Mutex<Vec<BorrowObservation>>>,
+    panic_on_end: Arc<AtomicBool>,
+}
+
+impl SpanProcessor for SynchronousCapture {
+    fn on_start(&self, _: &mut Span, _: &Context) {}
+
+    fn on_end(&self, span: SpanData) {
+        assert!(matches!(span.name, Cow::Borrowed(_)));
+        let mut addresses = vec![span.name.as_ptr() as usize];
+        let attributes = span
+            .attributes
+            .iter()
+            .map(|attribute| {
+                addresses.push(attribute.key.as_str().as_ptr() as usize);
+                let value = match &attribute.value {
+                    opentelemetry::Value::String(value) => {
+                        addresses.push(value.as_str().as_ptr() as usize);
+                        opentelemetry::Value::from(value.as_str().to_owned())
+                    }
+                    value => value.clone(),
+                };
+                KeyValue::new(attribute.key.as_str().to_owned(), value)
+            })
+            .collect();
+        self.observations.lock().unwrap().push(BorrowObservation {
+            name: span.name.to_string(),
             attributes,
-        },
-        capture,
-    )
+            addresses,
+        });
+        if self.panic_on_end.swap(false, Ordering::Relaxed) {
+            panic!("synchronous export panic");
+        }
+        // SpanData and all borrowed references die here, also during unwinding.
+    }
+
+    fn force_flush(&self) -> OTelSdkResult {
+        Ok(())
+    }
+
+    fn shutdown_with_timeout(&self, _: Duration) -> OTelSdkResult {
+        Ok(())
+    }
 }
 
 fn reusable() -> *mut SpanHandle {
     let mut handle = ptr::null_mut();
     assert_eq!(unsafe { etw_span_handle_create(&mut handle) }, 0);
     handle
+}
+
+#[test]
+fn borrowed_dynamic_bytes_reach_export_unchanged_and_are_released_at_end() {
+    let capture = SynchronousCapture::default();
+    let provider = provider_with_processor(0, capture.clone());
+    unsafe {
+        let mut handle = reusable();
+        let address = handle;
+        for (cycle, panic) in [false, true, false].into_iter().enumerate() {
+            let mut name = format!("temporary-operation-{cycle}");
+            let mut key = format!("temporary-key-{cycle}");
+            let mut value = format!("temporary-value-{cycle}");
+            let expected_addresses = vec![
+                name.as_ptr() as usize,
+                key.as_ptr() as usize,
+                value.as_ptr() as usize,
+            ];
+            {
+                let attribute = Attribute {
+                    key: Text::borrowed(&key),
+                    kind: 1,
+                    string_value: Text::borrowed(&value),
+                    integer_value: 0,
+                };
+                assert_eq!(
+                    etw_span_begin_borrowed(
+                        &provider,
+                        Text::borrowed(&name),
+                        &attribute,
+                        1,
+                        handle,
+                    ),
+                    0
+                );
+            } // Descriptor storage is not borrowed.
+            {
+                let rejected = String::from("rejected-input");
+                assert_eq!(
+                    etw_span_begin_borrowed(
+                        &provider,
+                        Text::borrowed(&rejected),
+                        ptr::null(),
+                        0,
+                        handle,
+                    ),
+                    INVALID_STATE
+                );
+            } // Rejected begin does not retain its inputs.
+            assert_eq!(etw_span_handle_destroy(&mut handle), INVALID_STATE);
+            assert_eq!(etw_span_status(handle, 1), 0);
+            capture.panic_on_end.store(panic, Ordering::Relaxed);
+            assert_eq!(etw_span_end_reuse(handle), if panic { PANIC } else { 0 });
+            assert_eq!(handle, address);
+            assert!((*handle).active.is_none());
+            assert_eq!(etw_current_span_valid(), 0);
+
+            // End has released ALL borrowed bytes, even after an export panic.
+            name.clear();
+            key.clear();
+            value.clear();
+            drop((name, key, value));
+            let observations = capture.observations.lock().unwrap();
+            let observed = &observations[cycle];
+            assert_eq!(observed.addresses, expected_addresses);
+            assert_eq!(observed.name, format!("temporary-operation-{cycle}"));
+            assert_eq!(
+                observed.attributes,
+                vec![KeyValue::new(
+                    format!("temporary-key-{cycle}"),
+                    format!("temporary-value-{cycle}")
+                )]
+            );
+        }
+        assert_eq!(etw_span_handle_destroy(&mut handle), 0);
+    }
+}
+
+#[test]
+fn rejected_borrowed_begin_retains_nothing_and_rejected_end_keeps_borrow_active() {
+    let capture = SynchronousCapture::default();
+    let provider = provider_with_processor(0, capture.clone());
+    unsafe {
+        let mut outer = reusable();
+        let mut inner = reusable();
+        {
+            let name = String::from("failed-begin");
+            let bad_attribute = Attribute {
+                key: Text::borrowed(&name),
+                kind: 99,
+                string_value: Text::borrowed(&name),
+                integer_value: 0,
+            };
+            assert_eq!(
+                etw_span_begin_borrowed(&provider, Text::borrowed(&name), &bad_attribute, 1, outer),
+                BAD_ARGUMENT
+            );
+        }
+        assert!((*outer).active.is_none());
+        assert_eq!(etw_current_span_valid(), 0);
+        let outer_name = String::from("outer-borrow");
+        assert_eq!(
+            etw_span_begin_borrowed(
+                &provider,
+                Text::borrowed(&outer_name),
+                ptr::null(),
+                0,
+                outer
+            ),
+            0
+        );
+        {
+            let inner_name = String::from("inner-borrow");
+            assert_eq!(
+                etw_span_begin_borrowed(
+                    &provider,
+                    Text::borrowed(&inner_name),
+                    ptr::null(),
+                    0,
+                    inner
+                ),
+                0
+            );
+            assert_eq!(etw_span_end_reuse(outer), OUT_OF_ORDER);
+            assert!((*outer).active.is_some());
+            assert!(capture.observations.lock().unwrap().is_empty());
+            assert_eq!(etw_span_end_reuse(inner), 0);
+        }
+        // The outer name remained alive through its rejected end and inner end.
+        assert_eq!(etw_span_end_reuse(outer), 0);
+        drop(outer_name);
+        assert_eq!(etw_current_span_valid(), 0);
+        assert_eq!(etw_span_handle_destroy(&mut inner), 0);
+        assert_eq!(etw_span_handle_destroy(&mut outer), 0);
+        let observations = capture.observations.lock().unwrap();
+        assert_eq!(observations.len(), 2);
+        assert_eq!(observations[0].name, "inner-borrow");
+        assert_eq!(observations[1].name, "outer-borrow");
+    }
 }
 
 #[test]

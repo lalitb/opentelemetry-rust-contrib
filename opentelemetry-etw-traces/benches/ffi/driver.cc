@@ -3,6 +3,7 @@
 #include <array>
 #include <fstream>
 #include <iostream>
+#include <string>
 #include <thread>
 
 constexpr const char *revision = ETW_BENCH_REVISION;
@@ -157,6 +158,37 @@ void ContractChecks(Workload &workload)
     Check(etw_span_handle_destroy(&reusable));
     Require(!reusable, "Destroy did not clear slot");
   }
+
+  EtwSpan *borrowed{};
+  Check(etw_span_handle_create(&borrowed));
+  for (unsigned cycle = 0; cycle < 2; ++cycle)
+  {
+    // These are ordinary local std::strings, including heap-backed storage.
+    // Their bytes remain unchanged only until synchronous end returns.
+    std::string borrowed_name = "BenchmarkOperation";
+    std::string borrowed_key = "string_key";
+    std::string borrowed_value = "benchmark-value";
+    borrowed_name.reserve(256);
+    borrowed_key.reserve(256);
+    borrowed_value.reserve(256);
+    {
+      auto descriptors = workload.attributes;
+      descriptors[0].key = {borrowed_key.data(), borrowed_key.size()};
+      descriptors[0].string_value = {borrowed_value.data(), borrowed_value.size()};
+      Check(etw_span_begin_borrowed(workload.provider,
+          {borrowed_name.data(), borrowed_name.size()},
+          descriptors.data(), workload.count, borrowed));
+    } // Descriptors may be destroyed before end; string bytes must remain.
+    const auto status = etw_span_status(borrowed, 1);
+    const auto end = etw_span_end_reuse(borrowed);
+    Check(end);
+    Check(status);
+    borrowed_name.assign(512, 'X');
+    borrowed_key.assign(512, 'X');
+    borrowed_value.assign(512, 'X');
+    Require(!etw_current_span_valid(), "Borrowed end did not restore context");
+  } // All temporary strings are destroyed before the reusable handle.
+  Check(etw_span_handle_destroy(&borrowed));
 }
 
 nlohmann::json Memory(Workload &workload)
@@ -259,7 +291,7 @@ int main(int argc, char **argv)
     char guid[36]{};
     etw_provider_guid(guid);
     const size_t expected = mode == "latency" ? batches * (iterations + warmup)
-                           : mode == "memory" ? 1002 : 7;
+                           : mode == "memory" ? 1002 : 9;
     nlohmann::json output{
         {"pid", GetCurrentProcessId()}, {"mode", mode}, {"variant", variant},
         {"attribute_count", count}, {"revision", revision},
