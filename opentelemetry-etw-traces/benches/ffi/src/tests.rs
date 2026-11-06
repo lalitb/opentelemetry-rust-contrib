@@ -15,10 +15,26 @@ struct Capture {
 
 impl SpanProcessor for Capture {
     fn on_start(&self, _: &mut Span, _: &Context) {}
-    fn on_end(&self, span: SpanData) {
+    fn on_end(&self, mut span: SpanData) {
         if self.panic_on_end.swap(false, Ordering::Relaxed) {
             panic!("contract-test exporter panic");
         }
+        // The test observer may retain owned snapshots, never borrowed FFI input.
+        span.name = Cow::Owned(span.name.into_owned());
+        span.attributes = span
+            .attributes
+            .into_iter()
+            .map(|attribute| {
+                let key = attribute.key.as_str().to_owned();
+                let value = match attribute.value {
+                    opentelemetry::Value::String(value) => {
+                        opentelemetry::Value::from(value.as_str().to_owned())
+                    }
+                    value => value,
+                };
+                KeyValue::new(key, value)
+            })
+            .collect();
         self.spans.lock().unwrap().push(span);
     }
     fn force_flush(&self) -> OTelSdkResult {
@@ -277,7 +293,7 @@ fn reuse_and_invalid_lifecycle_preserve_handle_and_context() {
                 0
             );
             let context = Context::current().span().span_context().clone();
-            for begin in [etw_span_begin_reuse, etw_span_begin_static] {
+            for begin in [etw_span_begin_reuse, etw_span_begin_borrowed] {
                 assert_eq!(
                     begin(&provider, Text::borrowed(NAME), ptr::null(), 0, handle),
                     INVALID_STATE
@@ -348,8 +364,9 @@ fn copying_inputs_can_be_overwritten_and_freed_before_end() {
 }
 
 #[test]
-fn static_bytes_are_borrowed_but_descriptors_are_call_scoped() {
-    let (provider, capture) = provider(3);
+fn literal_bytes_are_borrowed_but_descriptors_are_call_scoped() {
+    let capture = SynchronousCapture::default();
+    let provider = provider_with_processor(3, capture.clone());
     let keys;
     let string_value;
     unsafe {
@@ -359,7 +376,7 @@ fn static_bytes_are_borrowed_but_descriptors_are_call_scoped() {
             keys = attributes.each_ref().map(|a| a.key.data);
             string_value = attributes[0].string_value.data;
             assert_eq!(
-                etw_span_begin_static(
+                etw_span_begin_borrowed(
                     &provider,
                     Text::borrowed(NAME),
                     attributes.as_ptr(),
@@ -372,18 +389,20 @@ fn static_bytes_are_borrowed_but_descriptors_are_call_scoped() {
         assert_eq!(etw_span_end_reuse(handle), 0);
         assert_eq!(etw_span_handle_destroy(&mut handle), 0);
     }
-    let spans = capture.spans.lock().unwrap();
-    let span = &spans[0];
-    assert!(matches!(span.name, Cow::Borrowed(_)));
-    assert_eq!(span.name.as_ptr(), NAME.as_ptr());
-    assert_eq!(span.attributes, provider.attributes);
-    for (actual, expected) in span.attributes.iter().zip(keys) {
-        assert_eq!(actual.key.as_str().as_ptr(), expected);
-    }
-    let opentelemetry::Value::String(value) = &span.attributes[0].value else {
-        panic!("expected string");
-    };
-    assert_eq!(value.as_str().as_ptr(), string_value);
+    let observations = capture.observations.lock().unwrap();
+    let observed = &observations[0];
+    assert_eq!(observed.name, NAME);
+    assert_eq!(observed.attributes, provider.attributes);
+    assert_eq!(
+        observed.addresses,
+        vec![
+            NAME.as_ptr() as usize,
+            keys[0] as usize,
+            string_value as usize,
+            keys[1] as usize,
+            keys[2] as usize,
+        ]
+    );
 }
 
 #[test]
@@ -396,7 +415,7 @@ fn invalid_inputs_do_not_activate_or_consume_reusable_storage() {
     let (provider, capture) = provider(3);
     unsafe {
         let mut handle = reusable();
-        for begin in [etw_span_begin_reuse, etw_span_begin_static] {
+        for begin in [etw_span_begin_reuse, etw_span_begin_borrowed] {
             assert_eq!(
                 begin(&provider, invalid, ptr::null(), 0, handle),
                 BAD_ARGUMENT
@@ -465,7 +484,7 @@ fn mixed_nested_spans_restore_the_exact_previous_context() {
         assert_eq!(etw_span_handle_destroy(&mut outer), INVALID_STATE);
         let outer_id = Context::current().span().span_context().clone();
         assert_eq!(
-            etw_span_begin_static(&provider, Text::borrowed("inner"), ptr::null(), 0, inner),
+            etw_span_begin_borrowed(&provider, Text::borrowed("inner"), ptr::null(), 0, inner),
             0
         );
         let inner_id = Context::current().span().span_context().clone();
@@ -506,7 +525,7 @@ fn wrong_thread_rejects_all_reusable_operations_without_mutating_state() {
             // call, not simultaneous access to the non-Send ContextGuard.
             std::thread::spawn(move || {
                 let mut alias = address as *mut SpanHandle;
-                for begin in [etw_span_begin_reuse, etw_span_begin_static] {
+                for begin in [etw_span_begin_reuse, etw_span_begin_borrowed] {
                     assert_eq!(
                         begin(
                             provider_address as *const ProviderHandle,

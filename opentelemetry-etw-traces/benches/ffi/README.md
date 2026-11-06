@@ -18,7 +18,6 @@ are 1 (string), 2 (int64), and 3 (boolean, represented by 0 or 1).
 | `etw_span_handle_create` | Allocates inactive, reusable opaque storage once, on its owner thread. |
 | `etw_span_begin_reuse` | Initializes inactive storage, copying all strings. Caller buffers may be overwritten or freed after return. |
 | `etw_span_begin_borrowed` | Initializes inactive storage without copying string bytes. Keep them alive and unchanged until synchronous end returns. |
-| `etw_span_begin_static` | Initializes inactive storage with explicitly borrowed process-lifetime strings; see the stronger contract below. |
 | `etw_span_status` | Works on either kind of active handle: 0 = Unset, 1 = Ok, 2 = Error. |
 | `etw_span_end_reuse` | Ends through the SDK and ETW processor, restores the previous context, and resets to inactive without freeing storage. |
 | `etw_span_handle_destroy` | Destroys inactive reusable storage in Rust and nulls the slot. It never implicitly ends an active span. |
@@ -49,8 +48,9 @@ must never `free` or `delete` Rust handles.
 
 ### Borrowing local strings until synchronous end returns
 
-Use `etw_span_begin_borrowed` with ordinary local `std::string` or `char[]`
-inputs. **All span-name, attribute-key, and string-value bytes must remain alive
+Use `etw_span_begin_borrowed` with string literals, ordinary local `std::string`,
+or `char[]` inputs. The same function handles all three. **All span-name,
+attribute-key, and string-value bytes must remain alive
 and unchanged from begin through the return of `etw_span_end_reuse`.** Do not
 modify, move, destroy, or reallocate their storage while the span is active.
 String literals and local strings can be mixed under this same contract.
@@ -78,22 +78,6 @@ shorter foreign lifetime in `Strings::read`. Its safety depends on that fixed,
 non-retaining pipeline and cleanup on both success and unwinding. This is not a
 contract for arbitrary SDK samplers/processors that cache or queue spans. Changes
 to the provider or pinned SDK need to recheck the no-retention invariant.
-
-### Explicit static-string contract
-
-`etw_span_begin_static` retains its original, stronger contract. **Every span-name, attribute-key,
-and string-value byte must remain immutable and valid until process exit**,
-including after end, handle destruction, and provider shutdown. Keep containing
-modules loaded for that entire lifetime. An ordinary temporary `std::string`,
-mutable buffer, or literal in an unloadable DLL does not satisfy this contract.
-There is no mixed static/dynamic mode: use a copying begin if any string cannot
-meet the promise.
-
-The **attribute descriptor array needs to live only during begin** and may be
-overwritten/released immediately afterward. Integer/boolean values are copied.
-The opt-in conversions in `Strings::read` document both borrowing contracts.
-UTF-8 validation uses `str::from_utf8`, without allocating; it cannot establish
-lifetime. Neither copying API silently borrows strings.
 
 ### C: reusable storage with temporary inputs
 
@@ -173,11 +157,11 @@ void example(EtwProvider *provider)
 }
 ```
 
-### C++: reusable storage with immutable process-lifetime strings
+### C++: the same borrowing API with string literals
 
-Here all strings are literals in the executable. If moved to a DLL/plugin,
-that module must remain loaded until process exit. The local descriptor array
-is deliberately not static.
+Here all strings are literals in the executable. Literals already satisfy the
+borrow-until-end contract. For literals in a DLL/plugin, keep that module loaded
+until end returns. The local descriptor array is needed only during begin.
 
 ```cpp
 #include "ffi.h"
@@ -198,7 +182,7 @@ void example(EtwProvider *provider) // caller keeps provider alive
                 {text("integer_key"), 2, text(""), 42},
                 {text("bool_key"), 3, text(""), 1},
             };
-            check(etw_span_begin_static(provider, text("BenchmarkOperation"),
+            check(etw_span_begin_borrowed(provider, text("BenchmarkOperation"),
                                         attributes, 3, span));
         } // descriptors may disappear; their referenced bytes must not
         const auto status = etw_span_status(span, 1);
@@ -214,8 +198,8 @@ void example(EtwProvider *provider) // caller keeps provider alive
 
 Reusable storage removes the per-span wrapper `Box` allocation; there is still
 one allocation when creating each handle. Copying begins still allocate/copy
-the nonempty span name, every key, and every string value. The borrowed and static
-begins reference those bytes instead. Neither retains the descriptor array.
+the nonempty span name, every key, and every string value. Borrowed begin
+references those bytes instead. It does not retain the descriptor array.
 
 All paths still run the native Rust SDK. With attributes, the FFI builds **one
 `Vec<KeyValue>` and moves its buffer directly into `SpanBuilder.attributes`**.
@@ -235,11 +219,12 @@ are preserved. Flat Geneva mapping and the PR's separate stage-benchmark APIs
 are **not** included. These optimizations also reduce the native exporter
 baseline; compare all FFI variants against the native result from this checkout.
 
-The target for reusable/static is to remove the copying wrapper's incremental
+The target for reusable/borrowed is to remove the copying wrapper's incremental
 **2 allocations/span with zero attributes, 6 with these three attributes**,
 relative to native SDK tracing. Reusable/copying removes just the handle
-allocation. The elevated measurements below meet these targets for this
-workload; they are not allocation guarantees for other workloads or SDK versions.
+allocation. The historical elevated measurements below met these targets for the
+earlier literal-input borrowing path. Rerun the current variants to measure this version;
+these are not allocation guarantees for other workloads or SDK versions.
 Do not substitute historical benchmark counts or timings for a run of this checkout.
 
 ## Benchmark paths
@@ -250,9 +235,9 @@ Do not substitute historical benchmark counts or timings for a run of this check
 | `wrapper` | Rust calls the existing copying/allocating C ABI wrapper. |
 | `cpp` | C++ calls that same existing wrapper in the Rust DLL. |
 | `rust-reuse` | Rust calls reusable begin with copying inputs, status, reusable end. |
-| `rust-static` | Rust calls reusable static begin, status, reusable end. |
+| `rust-borrowed` | Rust calls reusable borrowed begin, status, reusable end. |
 | `cpp-reuse` | C++ calls the same reusable copying API. |
-| `cpp-static` | C++ calls the same reusable static API. |
+| `cpp-borrowed` | C++ calls the same reusable borrowed API. |
 
 Every case runs with zero and three attributes (string, integer, boolean), the
 same DLL, always-on sampler, empty resource, name, Server kind, and Ok status.
@@ -261,9 +246,11 @@ No synthetic application work is added. Reusable handles are created on the
 measuring thread before warm-up/timing and destroyed after measurement.
 They are reused across batches, not recreated inside `etw_rust_batch_reuse`.
 
-The seven timed variants and recorded results below predate the borrowed-until-end
-entrypoint. The C/C++ contract checks now also cover temporary strings with
-`etw_span_begin_borrowed`; no new latency/allocation measurements are claimed for it.
+The timed borrowing variants now use `etw_span_begin_borrowed` with literal inputs.
+The C/C++ contract checks also cover temporary strings with the same entrypoint.
+The recorded results below predate this consolidation; no new latency/allocation
+measurements are claimed. Rebuild and rerun all variants before generating a new
+report; older result directories use different variant names.
 
 Handle creation/destruction have separate `handle_create_ns`/`handle_destroy_ns`
 latency observations (one each per process, including timer noise; non-reusable
@@ -319,7 +306,7 @@ cargo test -p opentelemetry-etw-traces --all-features -- --ignored --test-thread
 ```
 
 The tests cover handle reuse, invalid lifecycles, dynamic buffers overwritten
-and freed before end, static byte borrowing with temporary descriptors, borrowed
+and freed before end, literal byte borrowing with temporary descriptors, borrowed
 temporary strings released after end (including export panic), nested
 parent/context restoration, provider changes while inactive, wrong-thread
 rejection, export-panic cleanup, and equivalent SDK-exported content for the
@@ -355,10 +342,12 @@ source changes because run scripts reject stale manifests. Allow several GB
 for a full fourteen-pass capture. These results are not a comparison to a C++
 exporter, Linux user-events, or asynchronous/many-thread application workloads.
 
-### Recorded validation before the borrowed-until-end addition
+### Historical validation and measurements
 
-The following Windows results were recorded before `etw_span_begin_borrowed` was
-added. New contract checks require a fresh build/run; the current C++ capture
+The following Windows results were recorded before the borrowing API was
+consolidated. The historical borrowing cases used literals with a stronger
+lifetime contract; they are not measurements of the current binary or variants.
+New contract checks require a fresh build/run; the current C++ capture
 expects 18 contract events across the zero/three-attribute cases (previously 14).
 
 On the original Windows checkout, Rust 1.99.0 formatting/Clippy, nine Rust ABI contracts,
@@ -380,13 +369,14 @@ branch's historical results.
 Steady requested-heap allocation counts per span (Rust and C++ caller results
 agree):
 
-| Attributes | Native SDK + optimized ETW | Existing copying wrapper | Reusable/copying | Reusable/static |
+| Attributes | Native SDK + optimized ETW | Existing copying wrapper | Reusable/copying | Reusable/borrowed literals (historical) |
 | --- | --- | --- | --- | --- |
 | 0 | 2 | 4 | 3 | 2 |
 | 3 | 3 | 9 | 8 | 3 |
 
-Reusable/static therefore adds **zero allocations above the native baseline**
-for both workloads; it removes the wrapper's incremental 2/6 allocations.
+The historical reusable borrowing path therefore added **zero allocations above
+the native baseline** for both workloads; it removed the wrapper's incremental
+2/6 allocations.
 Remaining requested bytes/span are 384/552, matching native. Each reusable
 handle's separate setup allocates one 56-byte block. The worker retains 512
 requested bytes after handle destruction, all freed at thread exit; while
@@ -403,9 +393,9 @@ averages per case (14 processes x 7 batches):
 | `wrapper` | 2.853 | 3.318 |
 | `cpp` | 2.888 | 3.355 |
 | `rust-reuse` | 2.827 | 3.273 |
-| `rust-static` | 2.789 | 3.072 |
+| Rust borrowed literals (historical) | 2.789 | 3.072 |
 | `cpp-reuse` | 2.864 | 3.320 |
-| `cpp-static` | 2.751 | 3.108 |
+| C++ borrowed literals (historical) | 2.751 | 3.108 |
 
 Separate handle setup/destruction costs, microseconds, medians of one cold
 observation per process; these include timer/cold-code noise and are **not**
@@ -414,11 +404,11 @@ included in the per-span times above:
 | Variant | Create, 0 / 3 attributes | Destroy, 0 / 3 attributes |
 | --- | --- | --- |
 | `rust-reuse` | 6.50 / 8.25 | 0.30 / 0.30 |
-| `rust-static` | 6.75 / 7.50 | 0.30 / 0.30 |
+| Rust borrowed literals (historical) | 6.75 / 7.50 | 0.30 / 0.30 |
 | `cpp-reuse` | 7.00 / 7.00 | 0.30 / 0.30 |
-| `cpp-static` | 7.35 / 7.60 | 0.30 / 0.40 |
+| C++ borrowed literals (historical) | 7.35 / 7.60 | 0.30 / 0.40 |
 
-The C++ static path was 0.96% / 7.35% above native latency (0/3 attributes),
+The historical C++ borrowing path was 0.96% / 7.35% above native latency (0/3 attributes),
 despite matching allocation counts. Checks, UTF-8 scanning, conversions and
 ABI calls still cost time. These are machine-specific observations, not an
 equivalence proof or latency guarantee. In particular, the Rust copying-wrapper

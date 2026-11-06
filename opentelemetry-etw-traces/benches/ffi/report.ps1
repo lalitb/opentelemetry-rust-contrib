@@ -13,7 +13,7 @@ function Stats($values) {
     return [ordered]@{ count=$v.Count; min=$m.Minimum; median=(Median $v); max=$m.Maximum; mean=$m.Average }
 }
 $summary = [ordered]@{ smoke=[bool]$Smoke }
-$variants = @('native','wrapper','cpp','rust-reuse','rust-static','cpp-reuse','cpp-static')
+$variants = @('native','wrapper','cpp','rust-reuse','rust-borrowed','cpp-reuse','cpp-borrowed')
 $suffix = if ($Smoke) { '-smoke' } else { '' }
 $total = 0
 foreach ($mode in @('latency','memory')) {

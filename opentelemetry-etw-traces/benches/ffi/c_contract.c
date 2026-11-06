@@ -8,7 +8,7 @@ int main(void)
 {
   EtwProvider *provider = NULL;
   EtwSpan *span = NULL;
-  const EtwText static_name = TEXT("BenchmarkOperation");
+  const EtwText literal_name = TEXT("BenchmarkOperation");
   CHECK(etw_provider_create(0, &provider));
   CHECK(etw_span_handle_create(&span));
   for (unsigned i = 0; i < 2; ++i)
@@ -21,7 +21,7 @@ int main(void)
     CHECK(etw_span_end_reuse(span));
     if (etw_current_span_valid() || etw_span_end_reuse(span) != ETW_INVALID_STATE)
       return __LINE__;
-    CHECK(etw_span_begin_static(provider, static_name, NULL, 0, span));
+    CHECK(etw_span_begin_borrowed(provider, literal_name, NULL, 0, span));
     CHECK(etw_span_status(span, 1));
     CHECK(etw_span_end_reuse(span));
     {

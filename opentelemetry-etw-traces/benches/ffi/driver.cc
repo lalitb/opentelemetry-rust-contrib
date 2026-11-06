@@ -38,7 +38,7 @@ struct Workload
   {
     if (Reusable())
     {
-      const auto begin = variant == 6 ? etw_span_begin_static : etw_span_begin_reuse;
+      const auto begin = variant == 6 ? etw_span_begin_borrowed : etw_span_begin_reuse;
       Check(begin(provider, Text("BenchmarkOperation"), attributes.data(), count, handle));
       const auto status = etw_span_status(handle, 1);
       const auto end = etw_span_end_reuse(handle);
@@ -109,7 +109,7 @@ void ContractChecks(Workload &workload)
   workload.CppEmit();
   Require(!etw_current_span_valid(), "Context leaked");
 
-  for (const auto begin : {etw_span_begin_reuse, etw_span_begin_static})
+  for (const auto begin : {etw_span_begin_reuse, etw_span_begin_borrowed})
   {
     EtwSpan *reusable{};
     Check(etw_span_handle_create(&reusable));
@@ -130,7 +130,7 @@ void ContractChecks(Workload &workload)
       }
       Check(begin(workload.provider, copying ? Text(dynamic_name) : Text("BenchmarkOperation"),
                   descriptors.data(), workload.count, reusable));
-      // Only dynamic bytes are overwritten; static input bytes always remain literals.
+      // Only copying inputs are overwritten; borrowed inputs here are literals.
       memset(dynamic_name, 'X', sizeof(dynamic_name) - 1);
       memset(dynamic_key, 'X', sizeof(dynamic_key) - 1);
       memset(dynamic_value, 'X', sizeof(dynamic_value) - 1);
@@ -280,7 +280,7 @@ int main(int argc, char **argv)
     if (argc != 6) throw std::runtime_error("mode variant attributes ready gate | contracts");
     const std::string mode = argv[1], variant = argv[2];
     const std::array<std::string, 7> variants{
-        "native", "wrapper", "cpp", "rust-reuse", "rust-static", "cpp-reuse", "cpp-static"};
+        "native", "wrapper", "cpp", "rust-reuse", "rust-borrowed", "cpp-reuse", "cpp-borrowed"};
     const auto found = std::find(variants.begin(), variants.end(), variant);
     Require(found != variants.end(), "Unknown variant");
     const auto kind = static_cast<unsigned>(found - variants.begin());

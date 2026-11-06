@@ -53,7 +53,7 @@ foreach ($file in @('Cargo.lock','Cargo.toml','run.ps1')) {
 foreach ($file in @('compiler.txt','build-sources.csv','build-binaries.csv','revision.txt')) {
     Copy-Item (Join-Path $build $file) $root
 }
-$allVariants = @('native','wrapper','cpp','rust-reuse','rust-static','cpp-reuse','cpp-static')
+$allVariants = @('native','wrapper','cpp','rust-reuse','rust-borrowed','cpp-reuse','cpp-borrowed')
 # Rotations and reversals: every variant occupies each position twice.
 $orders = for ($offset = 0; $offset -lt $allVariants.Count; ++$offset) {
     $order = @(for ($i = 0; $i -lt $allVariants.Count; ++$i) {

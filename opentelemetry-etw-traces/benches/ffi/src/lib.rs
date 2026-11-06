@@ -2,8 +2,8 @@
 //! memory with no concurrent handle access. Handles are fixed to their creating thread.
 //! End spans in LIFO order; providers must outlive active spans and provider calls.
 //! The original API copies strings and consumes handles. Reusable handles have explicit
-//! destruction. `etw_span_begin_borrowed` borrows strings until synchronous end returns;
-//! `etw_span_begin_static` retains its stronger process-lifetime contract.
+//! destruction. `etw_span_begin_borrowed` borrows literals or dynamic strings until
+//! synchronous end returns.
 
 use opentelemetry::trace::{SpanKind, Status, TraceContextExt, Tracer, TracerProvider};
 use opentelemetry::{Context, ContextGuard, KeyValue};
@@ -167,21 +167,16 @@ unsafe fn span_ref<'a>(span: *mut SpanHandle) -> Result<&'a SpanHandle, u32> {
 #[derive(Clone, Copy)]
 enum Strings {
     Copy,
-    Static,
     BorrowedUntilEnd,
 }
 
 impl Strings {
-    /// All bytes must be valid for this call. For `Static`, they must additionally
-    /// remain immutable and valid until process exit, including module residency.
+    /// All bytes must be valid for this call.
     /// For `BorrowedUntilEnd`, they must remain immutable and valid until end has
     /// reset the handle; the provider must satisfy ProviderHandle's invariant.
     unsafe fn read(self, text: Text) -> Result<Cow<'static, str>, u32> {
         match self {
             Self::Copy => Ok(Cow::Owned(text.read()?.to_owned())),
-            // This conversion relies on the static entrypoint's caller promise,
-            // not the pointer value, descriptor lifetime, or UTF-8 validation.
-            Self::Static => Ok(Cow::Borrowed(text.read::<'static>()?)),
             // SAFETY: the SDK's string types require 'static, so this erases the
             // foreign borrow's shorter lifetime. This is confined to the fixed
             // synchronous provider: AlwaysOn retains nothing, on_start is a no-op,
@@ -418,24 +413,6 @@ pub unsafe extern "C" fn etw_span_begin_borrowed(
 #[no_mangle]
 #[inline(never)]
 /// # Safety
-/// As for `etw_span_begin_reuse`, EXCEPT all name/key/string-value bytes must remain
-/// immutable and valid until process exit, even after end/destroy/provider shutdown.
-/// Keep their containing modules loaded. Only the descriptor array is call-scoped.
-/// This explicit promise permits `Strings::read` to produce `&'static str`; checking
-/// UTF-8 cannot verify that promise. Never use temporary or unloadable-module strings.
-pub unsafe extern "C" fn etw_span_begin_static(
-    provider: *const ProviderHandle,
-    name: Text,
-    attributes: *const Attribute,
-    count: usize,
-    span: *mut SpanHandle,
-) -> u32 {
-    boundary(|| begin_reuse(provider, name, attributes, count, span, Strings::Static))
-}
-
-#[no_mangle]
-#[inline(never)]
-/// # Safety
 /// `span` must be a live handle with no concurrent use. Non-owner threads are rejected.
 pub unsafe extern "C" fn etw_span_status(span: *mut SpanHandle, status: u32) -> u32 {
     boundary(|| {
@@ -564,19 +541,19 @@ pub unsafe extern "C" fn etw_rust_batch(
 #[no_mangle]
 /// # Safety
 /// Provider and reusable handle must be live, on the owner thread, without concurrent
-/// use. The caller creates/destroys the handle outside timing. All borrowed strings
-/// below are Rust literals in this DLL, which must remain loaded until process exit.
+/// use. The caller creates/destroys the handle outside timing. The borrowed inputs
+/// are Rust literals in this DLL; every span is synchronously ended before return.
 pub unsafe extern "C" fn etw_rust_batch_reuse(
     provider: *const ProviderHandle,
     span: *mut SpanHandle,
-    static_inputs: u32,
+    borrowed_inputs: u32,
     iterations: usize,
 ) -> u32 {
     boundary(|| {
         let provider = provider.as_ref().ok_or(BAD_ARGUMENT)?;
-        let begin = match static_inputs {
+        let begin = match borrowed_inputs {
             0 => etw_span_begin_reuse,
-            1 => etw_span_begin_static,
+            1 => etw_span_begin_borrowed,
             _ => return Err(BAD_ARGUMENT),
         };
         let attributes = benchmark_attributes();

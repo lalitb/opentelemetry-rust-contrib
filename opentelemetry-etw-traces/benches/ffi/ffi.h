@@ -72,7 +72,7 @@ __declspec(dllimport) uint32_t etw_span_end(EtwSpan **);
  *   etw_span_status(span, 1);
  *   etw_span_end_reuse(span);  // repeat begin/end, using the same storage
  *   etw_span_handle_destroy(&span);
- * Use begin_borrowed or begin_static to avoid string copies, with the lifetimes below.
+ * Use begin_borrowed to avoid string copies, with the lifetime below.
  */
 __declspec(dllimport) uint32_t etw_span_handle_create(EtwSpan **);
 __declspec(dllimport) uint32_t etw_span_begin_reuse(
@@ -93,16 +93,6 @@ __declspec(dllimport) uint32_t etw_span_begin_reuse(
  */
 __declspec(dllimport) uint32_t etw_span_begin_borrowed(
     const EtwProvider *, EtwText, const EtwAttribute *, size_t, EtwSpan *);
-/* EXPLICIT STATIC-LIFETIME OPT-IN:
- * ALL span-name, key and string-value bytes must remain immutable and valid until
- * PROCESS EXIT, even after end/destroy/provider shutdown. Keep their containing
- * modules loaded for that entire lifetime. A pointer/UTF-8 check cannot prove this.
- * Rust borrows these bytes as &'static str without allocating/copying them.
- * The attribute DESCRIPTOR ARRAY need only be valid during begin; its storage is
- * NOT borrowed. The ordinary begin APIs NEVER infer this promise from pointers.
- */
-__declspec(dllimport) uint32_t etw_span_begin_static(
-    const EtwProvider *, EtwText, const EtwAttribute *, size_t, EtwSpan *);
 __declspec(dllimport) uint32_t etw_span_end_reuse(EtwSpan *);
 __declspec(dllimport) uint32_t etw_span_handle_destroy(EtwSpan **);
 /* Fallible lifecycle calls contain Rust unwinding (not abort/OOM). End has already
@@ -111,9 +101,7 @@ __declspec(dllimport) uint32_t etw_span_handle_destroy(EtwSpan **);
  * completed, not guaranteed ETW delivery. No completed-span export API exists.
  */
 
-/* Benchmark controls; handle setup/destruction is outside reusable batch timing.
- * Keep this DLL loaded until process exit when using its static-input batch.
- */
+/* Benchmark controls; handle setup/destruction is outside reusable batch timing. */
 __declspec(dllimport) uint32_t etw_rust_batch(const EtwProvider *, uint32_t, size_t);
 __declspec(dllimport) uint32_t etw_rust_batch_reuse(
     const EtwProvider *, EtwSpan *, uint32_t, size_t);
