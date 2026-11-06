@@ -194,6 +194,63 @@ void example(EtwProvider *provider) // caller keeps provider alive
 }
 ```
 
+### C++: nested spans with two reusable handles
+
+Each simultaneously active span needs its own handle. Begin attaches the span
+to the current thread, so the inner span automatically inherits the outer span's
+trace ID and uses its span ID as the parent. End the inner span first: this restores
+the outer context. Ending the outer span restores the context from before it began.
+
+This example allocates both handles once and reuses them across iterations. All
+calls run on the same thread, and the caller keeps the provider alive. It uses
+literals; local `std::string` inputs work too, provided each span's input bytes
+stay alive and unchanged until that span's end returns.
+
+```cpp
+#include "ffi.h"
+#include <cstdlib>
+
+template <size_t N>
+constexpr EtwText text(const char (&value)[N]) { return {value, N - 1}; }
+static void check(uint32_t code) { if (code != ETW_OK) std::abort(); }
+
+void nested_example(EtwProvider *provider)
+{
+    EtwSpan *outer = nullptr;
+    EtwSpan *inner = nullptr;
+    check(etw_span_handle_create(&outer));
+    check(etw_span_handle_create(&inner));
+
+    for (unsigned i = 0; i < 100; ++i) {
+        check(etw_span_begin_borrowed(
+            provider, text("outer-operation"), nullptr, 0, outer));
+        // Do outer work. The outer span is now the current parent.
+
+        check(etw_span_begin_borrowed(
+            provider, text("inner-operation"), nullptr, 0, inner));
+        // Do nested work. The inner span is now current.
+        const auto inner_status = etw_span_status(inner, 1);
+        const auto inner_end = etw_span_end_reuse(inner);
+        check(inner_end);
+        check(inner_status);
+
+        // Continue outer work with the outer span current again.
+        const auto outer_status = etw_span_status(outer, 1);
+        const auto outer_end = etw_span_end_reuse(outer);
+        check(outer_end);
+        check(outer_status);
+    }
+
+    check(etw_span_handle_destroy(&inner));
+    check(etw_span_handle_destroy(&outer));
+}
+```
+
+Trying to end `outer` while `inner` is active returns `ETW_OUT_OF_ORDER` and
+leaves both spans active. End `inner`, then `outer`; keep both sets of borrowed
+inputs valid until their respective ends complete. This example aborts on any
+error for brevity, as do the examples above.
+
 ## What still allocates or copies
 
 Reusable storage removes the per-span wrapper `Box` allocation; there is still
